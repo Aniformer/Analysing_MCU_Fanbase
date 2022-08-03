@@ -1,0 +1,2775 @@
+---
+fontsize: 12pt
+output: 
+  pdf_document: 
+    toc: yes
+    number_sections: yes
+    toc_depth : 4
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, eval = 
+                        FALSE)
+options(width=100) 
+#install.packages("formatR")
+#library(formatR)
+#knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 80), tidy = TRUE)
+
+```
+---
+
+\pagenumbering{gobble}
+# Setup 
+
+```{r Setup}
+library(rvest)
+library(tidyverse)
+library(tidyr)
+library(RSelenium)
+library(stringr)
+library(cld2)
+library(cld3)
+library(qdap)
+library(textclean)
+library(dplyr)
+library(tidytext)
+library(tm)
+library(patchwork)
+library(textstem)
+library(wordcloud)
+library(ggrepel)
+library(readr)
+library(scales)
+library(openxlsx)
+library(stringi)
+library(ggpubr)
+library(stats)
+library(stargazer)
+library(FSelector)
+library(udpipe)
+library(stm)
+library(FactoMineR)
+library(lda)
+library(gridExtra)
+
+```
+
+---
+
+# Part A
+## Construction of Corpus
+
+```{r Getting Movie Links, eval = FALSE}
+#URL for all Marvel movies
+marvel_movie_list <- "https://www.imdb.com/list/ls560528868/"
+marvel_movies_html <- read_html(marvel_movie_list)
+
+#Extracting links for each individual Marvel movie 
+marvel_movies_html %>%
+  html_nodes(".lister-item-content") %>% 
+  html_node(".lister-item-header") %>% 
+  html_element("a") %>% html_attr("href") -> marvel_movies_links
+
+#Constructing the proper movie URLs
+marvel_movies_links <- paste("https://www.imdb.com", marvel_movies_links, sep="")
+
+```
+
+## Extracting Review Data for Each Marvel Movie
+
+``` {r Extracting Reviews, eval = FALSE}
+#Function to extract review data url 
+extract_review_url <- function(link_html) {
+  
+  link_html %>%
+  html_node(".sc-10602b09-5") %>% 
+  html_node(".ipc-link") %>% 
+  html_attr("href") -> review_url
+
+return(review_url)
+}
+
+#Function to extract movie name 
+extract_movie_name <- function(link_html) {
+
+  link_html %>%
+  html_node(".sc-b73cd867-0") %>% 
+  html_text() -> movie_name
+  
+return (movie_name)
+}
+
+#Function to dynamically load all reviews for each movie
+load_all_reviews <- function(review_url,remDr) {
+remDr$navigate(review_url)
+
+#Below function constantly clicks on the load more button on the review URL 
+#to dynamically load all reviews for a movie
+tryCatch({
+    Sys.sleep(2)
+    suppressMessages({
+      loadmore <- remDr$findElement("id", "load-more-trigger")
+      while(loadmore$isElementDisplayed()[[1]]){
+        loadmore$clickElement()  
+        Sys.sleep(5)
+        loadmore <- remDr$findElement("id", "load-more-trigger")
+        
+      }
+    })
+  }, 
+  error = function(e) {
+    NA_character_
+  }
+  )
+
+return (remDr$getPageSource()[[1]])
+}
+
+#Function to extract review text for each movie 
+extract_reviews <- function(reviews_html) {
+  
+  reviews_html %>%
+  html_nodes(".lister-item-content") %>% html_node(".text") %>% 
+  html_text() -> rev_text
+  
+return (rev_text)
+}
+
+#Function to extract review rating
+extract_rating <- function(reviews_html) {
+  
+  reviews_html %>%
+  html_nodes(".lister-item-content") %>% html_node(".ipl-ratings-bar") %>%
+  html_node(".rating-other-user-rating") %>% html_element("span") %>% 
+  html_text() -> rev_rating
+
+return(rev_rating)
+}
+
+#Function to extract review date 
+extract_date <- function(reviews_html) {
+  
+  reviews_html %>% 
+  html_nodes(".review-date") %>% html_text() -> rev_date
+
+return(rev_date)
+
+}
+
+#Starting selenium chrome driver
+rD <- rsDriver(browser = "chrome", chromever = "100.0.4896.60", port=4433L, 
+               verbose=F)
+remDr <- rD[["client"]]
+
+movie_counter <- 1 
+movie_id <- vector()
+mov_name <- vector()
+rev_id <- vector()
+review_text <- vector()
+review_rating <- vector()
+review_date <- vector()
+
+#Extracting review data for each marvel movie
+for (link in marvel_movies_links)
+{ 
+  link_html <- read_html(link)
+  movie_name <- extract_movie_name(link_html)
+  review_url <- extract_review_url(link_html)
+  review_url <- paste("https://www.imdb.com", review_url, sep="")
+  reviews_url_html <- load_all_reviews(review_url, remDr)
+  reviews_html <- read_html(reviews_url_html)
+  rev_text <- str_squish(extract_reviews(reviews_html))
+  rev_rating <- extract_rating(reviews_html)
+  movie_id <- append(movie_id, rep(movie_counter, length(rev_text)))
+  mov_name <- append(mov_name, rep(movie_name, length(rev_text)))
+  rev_id <- append(rev_id, paste(as.character(movie_counter),  as.character(c(1:length(rev_text))), sep="_"))
+  review_text <- append(review_text, rev_text)
+  review_rating <- append(review_rating, rev_rating)
+  review_date <- append(review_date, extract_date(reviews_html))
+  movie_counter <- movie_counter + 1 
+
+}
+
+#Creating the movie reviews dataframe with the required columns 
+movies_review_data <- data.frame("Movie_ID" = movie_id, 
+                                 "Movie_Name" = mov_name, 
+                                 "Review_ID" = rev_id, 
+                                 "ReviewText" = review_text,
+                                 "Rating" = review_rating, 
+                                 "Review_Date" = review_date)
+
+saveRDS(movies_review_data, "Marvel_Reviews_Data.rds")
+
+```
+
+## Extracting metadata for each movie
+
+``` {r Extracting MetaData, eval = FALSE}
+#Function to extract movie rating
+extract_mov_rating <- function(link_html) {
+  
+  link_html %>%
+  html_node(".sc-7ab21ed2-1") %>% 
+  html_text() -> m_rating
+  
+return (m_rating)
+  
+}
+
+#Function to extract movie metascore
+extract_metascore <- function(link_html) {
+  
+  link_html %>% html_node(".score-meta") %>% 
+  html_text() -> meta_score 
+  
+return (meta_score)
+  
+}
+
+#Function to extract movie director
+extract_metascore <- function(link_html) {
+  
+  link_html %>% html_node(".score-meta") %>% 
+  html_text() -> meta_score 
+  
+return (meta_score)
+  
+}
+
+#Function to extract movie budget 
+extract_budget <- function(link_html) {
+  
+  link_html %>% html_node("div[data-testid=title-boxoffice-section]") %>%
+  html_node(".ipc-metadata-list-item__list-content-item") %>% 
+  html_text() -> budget 
+  budget <- gsub("(estimated)", "", budget)
+  budget <- gsub("[()]", "", budget)
+  budget <- str_squish(budget)
+
+return(budget)
+  
+}
+
+extract_gross <- function(link_html) {
+  
+  link_html %>% html_node("div[data-testid=title-boxoffice-section]") %>%
+  html_nodes(".ipc-metadata-list-item__list-content-item") -> list_tag
+  list_tag[[5]] %>% html_text -> gross
+
+return(gross)
+  
+}
+
+extract_runtime <- function(link_html) {
+  
+  link_html %>% html_node("div[data-testid=title-techspecs-section]") %>%
+  html_node(".ipc-metadata-list-item__content-container") %>% 
+  html_text() -> runtime
+  
+return(runtime)
+  
+}
+
+extract_soundmix <- function(link_html){
+  
+  link_html %>% html_node("div[data-testid=title-techspecs-section]") %>%
+  html_nodes(".ipc-metadata-list__item") -> list_tag
+  for (tag in list_tag) {
+    if (tag %>% html_element("span")%>%html_text() == "Sound mix") {
+      tag %>% html_elements("a") -> ls_tag
+      for (i in 1:length(ls_tag)) {
+        if (i==1) {
+      soundmix <- ls_tag[i]%>%html_text()
+      next
+    }
+    soundmix <- paste(soundmix, ls_tag[i]%>%html_text(),  sep=", ")
+      }
+    break
+    }
+  }
+  
+return(soundmix)
+  
+}
+
+extract_storyline <- function(link_html) {
+  
+  link_html %>% html_node(".sc-1d9a673d-0") %>%
+  html_node(".ipc-html-content") %>% 
+  html_text() -> storyline 
+  
+return(storyline)
+  
+}
+
+extract_languages <- function(link_html){
+  
+  link_html %>% html_node("div[data-testid=title-details-section]") %>%
+  html_nodes(".ipc-metadata-list-item__content-container") -> list_tag
+  list_tag[[4]] %>% html_elements("a") -> list_tag  
+  for (i in 1:length(list_tag)) {
+    if (i==1) {
+      languages <- list_tag[i]%>%html_text()
+      next
+    }
+    languages <- paste(languages, list_tag[i]%>%html_text(),  sep=", ")
+  }
+  
+return(languages)
+  
+}
+
+extract_director <- function(link_html){
+  
+  link_html %>% html_node("section[data-testid=title-cast]") %>%
+  html_node(".ipc-metadata-list-item__content-container") %>% 
+  html_elements("a") -> list_tag
+  for (i in 1:length(list_tag)) {
+    if (i==1) {
+      director <- list_tag[i]%>% html_text()
+      next
+    }
+    director <- paste(director, list_tag[i]%>%html_text(), sep=", ")
+  }
+
+return(director)
+   
+}
+
+extract_release <- function(link_html) {
+  
+  link_html %>% html_node("div[data-testid=title-details-section]") %>%
+  html_nodes(".ipc-metadata-list-item__content-container") -> list_tag
+  list_tag[[1]] %>% html_element("a") %>% html_text() -> release
+  release <- str_replace(release, " \\s*\\([^\\)]+\\)", "")
+
+return(release)
+  
+}
+
+m_name <- vector()
+m_rating <- vector()
+metascore <- vector()
+budget <- vector()
+gross <- vector()
+runtime <- vector()
+soundmix <- vector()
+storyline <- vector()
+languages <- vector()
+director <- vector()
+m_id <- vector()
+release <- vector()
+movie_counter <- 1
+#Extracting metadata for each marvel movie
+for (link in marvel_movies_links)
+{ 
+  link_html <- read_html(link)
+  m_name <- append(m_name, extract_movie_name(link_html))
+  m_rating <- append(m_rating, extract_mov_rating(link_html))
+  metascore <- append(metascore, extract_metascore(link_html))
+  budget <- append(budget, extract_budget(link_html))
+  gross <- append(gross, extract_gross(link_html))
+  runtime <- append(runtime, extract_runtime(link_html))
+  soundmix <- append(soundmix, extract_soundmix(link_html))
+  storyline <- append(storyline, extract_storyline(link_html))
+  languages <- append(languages, extract_languages(link_html))
+  director <- append(director, extract_director(link_html))
+  release <- append(release, extract_release(link_html))
+  m_id <- append(m_id, movie_counter)
+  movie_counter <- movie_counter + 1
+}
+
+#Creating the movie metadata dataframe with the required columns 
+movies_metadata <- data.frame("Movie_ID" = m_id, 
+                                 "Movie_Name" = m_name, 
+                                 "Storyline" = storyline,
+                                 "Movie_Rating" = m_rating, 
+                                 "Metascore" = metascore,
+                                 "Budget" = budget, 
+                                 "Gross_Worldwide" = gross, 
+                                 "Runtime" = runtime, 
+                                 "Soundmix" = soundmix, 
+                                 "Languages" = languages, 
+                                 "Director" = director, 
+                                 "Release_Date" = release)
+
+movies_metadata["Phase"] <- c("Phase 1", "Phase 1", "Phase 1", "Phase 1", "Phase 1", "Phase 1", "Phase 2", "Phase 2", "Phase 2", "Phase 2", "Phase 2", "Phase 2", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 3", "Phase 4", "Phase 4", "Phase 4", "Phase 4")
+
+saveRDS(movies_metadata, "Marvel_Metadata.rds")
+
+```
+
+## Review Data Preprocessing
+
+```{r Reviews Preprocessing_PartA}
+movies_review_data <- readRDS("Marvel_Reviews_Data.rds")
+mov_reviews_cleaned <- movies_review_data
+
+#Checking structure of constructed movies review data
+str(mov_reviews_cleaned)
+
+#Converting columns to the appropritate datatype 
+mov_reviews_cleaned[["Rating"]] <- as.numeric(mov_reviews_cleaned[["Rating"]])
+mov_reviews_cleaned[["Review_Date"]] <- as.Date(mov_reviews_cleaned[["Review_Date"]], 
+                                                "%d %B %Y")
+
+mov_reviews_cleaned$ReviewText <- gsub(" found this helpful\\. Was this review helpful\\? Sign in to vote\\. Permalink", "", mov_reviews_cleaned$ReviewText)
+mov_reviews_cleaned$ReviewText <- gsub("\\s\\d+ out of \\d+$", "",
+                                       mov_reviews_cleaned$ReviewText)
+
+#Detecting language to filter for English reviews only
+mov_reviews_cleaned$cld2_lang <- cld2::detect_language(mov_reviews_cleaned$ReviewText)
+mov_reviews_cleaned$cld3_lang <- cld3::detect_language(mov_reviews_cleaned$ReviewText)
+which(mov_reviews_cleaned$cld2_lang != mov_reviews_cleaned$cld3_lang)
+#Upon manually checking results for cld2 and cld3, cld2 is better at 
+#identifying language correctly. 
+mov_reviews_cleaned$cld3_lang <- NULL
+
+table(mov_reviews_cleaned$cld2_lang !='en')
+#88 records have been identified as not English
+sum(is.na(mov_reviews_cleaned$cld2_lang))
+#95 records are given NA as a value for language idenitifed
+#Since number of records in both cases are very low compared to the size 
+#of the dataset, ignoring these records will not affect our analysis
+
+#Filtering for only English reviews
+mov_reviews_cleaned %>% filter(mov_reviews_cleaned$cld2_lang == 'en') -> 
+  mov_reviews_cleaned
+mov_reviews_cleaned['cld2_lang'] <- NULL
+
+#Trimming trailing, leading and whitespaces in between in text
+mov_reviews_cleaned$ReviewText <- str_squish(mov_reviews_cleaned$ReviewText)
+
+#Removing URLs from data
+#Removing urls starting with http
+mov_reviews_cleaned$ReviewText <- gsub("http\\S+\\s*", "", 
+                                       mov_reviews_cleaned$ReviewText)
+#Removing urls starting with www
+mov_reviews_cleaned$ReviewText <- gsub("www.\\S+\\.\\S+\\s*", "", 
+                                       mov_reviews_cleaned$ReviewText)
+#Checking if any other URLs are to be removed
+ex_url(mov_reviews_cleaned$ReviewText) [is.na(ex_url(mov_reviews_cleaned$ReviewText))==F]
+which(is.na(ex_url(mov_reviews_cleaned$ReviewText))==F)
+#Upon reviewing the above extracted URLs, they're word elongations 
+#in the form of 'www.' and not URLs, hence tackling them later. 
+
+#Removing numbers from data as they add no significant meaning 
+#(reviewed with multiple iterations)
+mov_reviews_cleaned$ReviewText <- gsub('[[:digit:]]+', '', 
+                                       mov_reviews_cleaned$ReviewText)
+
+#Converting to lowercase
+mov_reviews_cleaned$ReviewText <- tolower(mov_reviews_cleaned$ReviewText)
+
+#Removing text between brackets
+mov_reviews_cleaned$ReviewText <- bracketX(mov_reviews_cleaned$ReviewText)
+
+#Replacing contractions 
+mov_reviews_cleaned$ReviewText <- replace_contraction(mov_reviews_cleaned$ReviewText)
+
+#Replacing symbols
+mov_reviews_cleaned$ReviewText <- replace_symbol(mov_reviews_cleaned$ReviewText)
+
+#Replacing word elongations
+mov_reviews_cleaned$ReviewText <- replace_word_elongation(mov_reviews_cleaned$ReviewText, impart.meaning = FALSE)
+
+#Replacing abbreviations
+#Common abbreviations in reviews
+abv <- c("pls", "rofl", "btw", "asap", "b/c", "tbh", "rdj", "omg", "rn", "ppl", 
+         "bts", "lmao","dr")
+repl <- c("please","rolling on the floor laughing","by the way", 
+          "as soon as possible", "because", "to be honest", 
+          "robert downey jr", "oh my gosh", "right now", 
+          "people", "behind the scenes", "laughing my ass off","doctor")
+mov_reviews_cleaned$ReviewText<- replace_abbreviation(mov_reviews_cleaned$ReviewText, 
+                                                      abv, repl)
+
+#Removing punctuation
+mov_reviews_cleaned$ReviewText <- gsub('[[:punct:]]+',' ',
+                                      mov_reviews_cleaned$ReviewText)
+
+#Removing non ascii characters
+mov_reviews_cleaned$ReviewText <- replace_non_ascii(mov_reviews_cleaned$ReviewText)
+
+#Removing spaces
+mov_reviews_cleaned$ReviewText <- str_squish(mov_reviews_cleaned$ReviewText)
+
+#Plotting the length of reviews 
+( p1 <- mov_reviews_cleaned %>% mutate(rev_length = nchar(ReviewText)) %>% 
+    group_by(rev_length) %>% summarise(count = n()) %>%   
+    ggplot(.,aes(x=rev_length,y=count))+
+    geom_point()+geom_line()+geom_smooth()+
+    xlim(0,10000)+ylim(0,130)+
+labs(x = "Review Length", y = "Count", title = "Distribution of Review Length") )
+# From the plot it is clear that majority of the reviews 
+# have a length falling in the range of 100 - 5000 characters. 
+
+#Filtering for reviews that only fall within the above identified range
+mov_reviews_cleaned %>% filter(nchar(ReviewText) >= 100 & 
+                        nchar(ReviewText) <= 5000) -> mov_reviews_cleaned
+
+```
+
+## Metadata Preprocessing
+
+```{r Metadata Preprocessing_PartA}
+movies_metadata <- readRDS("Marvel_Metadata.rds")
+mov_meta_cleaned <- movies_metadata
+
+#Checking structure of movies metadata
+str(mov_meta_cleaned)
+
+#Converting columns to the appropritate datatype 
+mov_meta_cleaned[["Movie_Rating"]] <- as.numeric(mov_meta_cleaned[["Movie_Rating"]])
+mov_meta_cleaned[["Metascore"]] <- as.numeric(mov_meta_cleaned[["Metascore"]])
+mov_meta_cleaned[["Release_Date"]] <- as.Date(mov_meta_cleaned[["Release_Date"]], 
+                                            "%B %d, %Y")
+
+#Converting the runtime column to a unit in hours
+for (i in 1:length(mov_meta_cleaned$Runtime)) {
+  
+  temp <- as.numeric(unlist(regmatches(mov_meta_cleaned$Runtime[i], 
+                      gregexpr("[[:digit:]]+", mov_meta_cleaned$Runtime[i]))))
+  mov_meta_cleaned$Runtime[i] <- paste(temp[1], temp[2], sep=".")
+   
+}
+mov_meta_cleaned[["Runtime"]] <- as.numeric(mov_meta_cleaned[["Runtime"]])
+mov_meta_cleaned[["Phase"]]<- as.factor(mov_meta_cleaned[["Phase"]])
+
+#Detect language of Storyline
+mov_meta_cleaned$cld2_lang <- cld2::detect_language(mov_meta_cleaned$Storyline)
+#All storylines are in English
+
+mov_meta_cleaned$cld2_lang <- NULL
+#No URLs to remove in the Storyline
+which(is.na(ex_url(mov_meta_cleaned$Storyline))==F)
+
+#Removing numbers
+mov_meta_cleaned$Storyline <- gsub('[[:digit:]]+', '', mov_meta_cleaned$Storyline)
+
+#Converting to lowercase
+mov_meta_cleaned$Storyline <- tolower(mov_meta_cleaned$Storyline)
+
+#Removing text between brackets
+mov_meta_cleaned$Storyline <- bracketX(mov_meta_cleaned$Storyline)
+
+#Replacing contractions 
+mov_meta_cleaned$Storyline <- replace_contraction(mov_meta_cleaned$Storyline)
+
+#Replacing symbols
+mov_meta_cleaned$Storyline <- replace_symbol(mov_meta_cleaned$Storyline)
+
+#Replacing word elongations
+mov_meta_cleaned$Storyline <- replace_word_elongation(mov_meta_cleaned$Storyline, 
+                                                      impart.meaning = FALSE)
+
+abv <- c("dr")
+repl <- c("doctor")
+mov_meta_cleaned$Storyline<- replace_abbreviation(mov_meta_cleaned$Storyline, 
+                                                      abv, repl)
+
+#Removing punctuation
+mov_meta_cleaned$Storyline <- gsub('[[:punct:]]+',' ',mov_meta_cleaned$Storyline)
+
+#Removing non ascii characters
+mov_meta_cleaned$Storyline <- replace_non_ascii(mov_meta_cleaned$Storyline)
+
+#Trimming trailing, leading and whitespaces in between in text
+mov_meta_cleaned$Storyline <- str_squish(mov_meta_cleaned$Storyline)
+
+#Since there are only few instances and each instance has a maximum count of 1, 
+#including all of them. 
+( p2 <- mov_meta_cleaned %>% mutate(length = nchar(Storyline)) %>% 
+group_by(length) %>% summarise(count = n()) %>%   ggplot(.,aes(x=length,y=count))+geom_point()+geom_line()+geom_smooth()+
+    labs(x = "Storyline Length", y = "Count", 
+         title = "Distribution of Storyline Length") )
+
+saveRDS(mov_meta_cleaned, "PartA_Metadata_Cleaned.rds")
+saveRDS(mov_reviews_cleaned, "PartA_Reviews_Cleaned.rds")
+
+```
+
+## Tokenizing and stopwords removal
+
+``` {r Review Stopwords Removal}
+mov_meta_cleaned <- readRDS("PartA_Metadata_Cleaned.rds")
+mov_reviews_cleaned <- readRDS("PartA_Reviews_Cleaned.rds")
+data("stop_words")
+
+#Joining required metadata with review data
+mov_meta_cleaned %>% dplyr::select(Movie_ID, Movie_Rating, 
+                                   Metascore, Director, Phase) -> to_join
+mov_reviews_cleaned <- mov_reviews_cleaned %>% 
+  left_join(to_join, by = "Movie_ID")
+
+#Tokenizing review text column
+tokenized_revs <- tibble(Movie_ID = mov_reviews_cleaned$Movie_ID, Review_ID = mov_reviews_cleaned$Review_ID, text = mov_reviews_cleaned$ReviewText)
+revs_unigrams <- tokenized_revs %>% unnest_tokens(word,text)
+
+#Plotting frequent terms in reviews before stopword removal
+p3 <- revs_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(revs_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+coord_flip()+ labs(x = "Word", y = "Proportion of Word in Text", 
+     title = "Before Stopwords Removal") 
+
+#Removing stopwords 
+revs_unigrams <- revs_unigrams %>% anti_join(stop_words)
+
+#Lemmatization
+revs_unigrams$word <- lemmatize_words(revs_unigrams$word)
+
+#Plotting most frequent words, identifying custom stopwords
+p4 <- revs_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(revs_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(30) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+coord_flip()+ labs(x = "Word", y = "Proportion of Word in Text", 
+     title = "Identifying Custom Stopwords") 
+
+#Adding custom stopwords to stopwords list
+custom_stopwords = data.frame(word=c("mcu","marvel","movie","film","story", 
+"movies", "plot",  "time", "watch", 'films', 'scene', "lot","act", "i","people","character","feel", "worth", "superhero","comic","wait", "fan",
+"review", "ete", "als", "wenwu", "yadda", "exec", "ova", "awkafina", "wahmen", 
+"imdb", "erm","tih", "password","bird", "milf","bite","start","ew", "ama", "ax",
+"chil", "en", "apps", "imbd","cargo", "xbox","na"),lexicon=rep("custom",49))
+all_stopwords_revs <- rbind(custom_stopwords,stop_words)
+
+#Removing stopwords from reviewtext
+revs_unigrams <- revs_unigrams %>% anti_join(all_stopwords_revs)
+
+#Plotting frequent terms in reviews after stopword removal
+p5 <- revs_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(revs_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+coord_flip()+ labs(x = "Word", y = "Proportion of Word in Text", 
+     title = "After Stopwords Removal") 
+
+mov_reviews_cleaned$ReviewText <- removeWords(mov_reviews_cleaned$ReviewText, c(all_stopwords_revs$word))
+mov_reviews_cleaned$ReviewText <- str_squish(mov_reviews_cleaned$ReviewText)
+tokenized_revs <- tibble(Movie_ID = mov_reviews_cleaned$Movie_ID, Review_ID = mov_reviews_cleaned$Review_ID, text = mov_reviews_cleaned$ReviewText)
+
+```
+
+```{r Rev_Stopwords Comparison}
+#Identifying custom stopwords in reviews from plot below 
+print(p4)
+
+#Comparison of frequent words before and after stopwords removal in reviews
+print(p3+p5)
+
+```
+
+```{r Metadata Stopwords Removal}
+#Tokenizing storyline text column
+tokenized_meta <- tibble(Movie_ID = mov_meta_cleaned$Movie_ID, text = mov_meta_cleaned$Storyline)
+meta_unigrams <- tokenized_meta %>% unnest_tokens(word,text)
+
+#Plotting frequent terms in storyline before stopword removal
+p6 <- meta_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(meta_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+coord_flip()+ labs(x = "Word", y = "Proportion of Word in Text", 
+     title = "Before Stopwords Removal") 
+
+#Removing stopwords
+meta_unigrams <- meta_unigrams  %>% anti_join(stop_words)
+
+#Lemmatization
+meta_unigrams$word <- lemmatize_words(meta_unigrams$word)
+
+#Plotting most frequent words
+p7 <- meta_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(meta_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(30) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+  coord_flip()+
+  labs(x = "Word", y = "Proportion of Word in Text", 
+       title = "Identifying Custom Stopwords") 
+
+#Adding custom stopwords to stopwords list
+custom_stopwords = data.frame(word=c("marvel", "world"),
+                              lexicon=rep("custom",2))
+all_stopwords_meta <- rbind(custom_stopwords,stop_words)
+
+#Removing stopwords from storyline
+meta_unigrams <- meta_unigrams %>% anti_join(all_stopwords_meta)
+
+#Plotting frequent terms in storyline after stopword removal
+p8 <- meta_unigrams %>% group_by(word) %>% 
+summarise(count = n(), prop = count/nrow(meta_unigrams)) %>%
+arrange(desc(prop)) %>%
+top_n(20) %>%
+ggplot(.,aes(x=reorder(word,prop),y=prop))+geom_point(stat="identity")+
+coord_flip()+ labs(x = "Word", y = "Proportion of Word in Text", 
+     title = "After Stopwords Removal") 
+
+mov_meta_cleaned$Storyline <- removeWords(mov_meta_cleaned$Storyline, 
+                                          c(all_stopwords_meta$word))
+mov_meta_cleaned$Storyline <- str_squish(mov_meta_cleaned$Storyline)
+tokenized_meta <- tibble(Movie_ID = mov_meta_cleaned$Movie_ID, 
+                         text = mov_meta_cleaned$Storyline)
+
+```
+
+```{r Meta_Stopwords Comparison}
+#Identifying custom stopwords in storyline from plot below
+print(p7)
+
+#Comparison of frequent words before and after stopwords removal in storyline
+print(p6+p8)
+
+```
+
+## Important Words Across All Reviews
+### Unigrams Aggregation By Review
+
+```{r Unigrams Aggregation by Review}
+#Counting tokenized unigram counts by review ID
+tokenized_counts <- revs_unigrams %>%
+  count(Review_ID, word,sort = TRUE)
+
+#Getting total number of unigrams in each review
+total_words <- tokenized_counts %>%
+  group_by(Review_ID) %>%
+  summarize(total = sum(n))
+tokenized_counts <- tokenized_counts %>% 
+  left_join(total_words, by ="Review_ID")
+
+#Plotting the unigram word frequencies for entire corpus
+p9 <- tokenized_counts %>%
+  mutate(tf = n/total) %>%
+  ggplot(aes(x=tf))+
+  geom_histogram(show.legend = FALSE)+xlim(0.00,0.40)+
+labs(x="tf", y = "Count", title ="Unigram Frequencies for All Reviews")
+print(p9)
+
+#From the above plot it is clear that many words occur rarely 
+#while fewer words occur frequently, hence the Ziph's law plot should show this trend 
+p10 <- tokenized_counts%>%
+       group_by(word) %>% 
+       summarise(total = sum(n)) %>% 
+       arrange(desc(total)) %>% 
+      mutate(rank = row_number(),
+      tf = total/sum(total)) %>% 
+  ggplot(aes(rank, tf)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10() + 
+  labs(x="Rank", y="tf", title = "Ziph's Law for Unigrams in Reviews")
+print(p10)
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#since it penalizes words that are very common, Calculating tfidf for unigrams
+tokenized_tfidf <- tokenized_counts %>%
+    bind_tf_idf(word, Review_ID, n)
+
+#DTM for unigrams in reviews by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Review_ID, word, tf_idf) 
+dtm_tfidf
+#Reducing dimensionality, removing terms that are too common and too rare
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.99)
+
+#Converting dtm for unigrams to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Review_ID = document) -> dtm_1_df
+
+#Plotting top important unigrams in all reviews
+p11 <- dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(20) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Unigrams in All Reviews")
+print(p11)
+
+#Wordcloud for important unigrams in all Reviews
+dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Unigrams in Reviews")  
+
+#Average Review Rating vs Average Critic Score for Imp Words
+mov_reviews_cleaned %>% dplyr::select(Review_ID, Rating, Metascore) -> to_join
+dtm_1_df <- dtm_1_df %>% left_join(to_join, by = "Review_ID")
+dtm_1_df <- na.omit(dtm_1_df)
+
+p12 <- dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_rating = mean(Rating), 
+            avg_score = mean(Metascore)) %>% 
+  top_n(15, total_tf_idf)  %>%
+  ggplot(aes(avg_rating, avg_score)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term)) +
+  labs(title="Ratings vs Critic Score for Top Unigrams in Reviews",
+         y = "Average Critic Score",
+         x = "Average Review Rating") 
+
+print(p12)
+```
+
+### Bigrams Aggregation by Review
+
+```{r Bigrams Aggregation by Review}
+#Extracting bigrams in all reviews
+revs_bigrams <- tokenized_revs %>% 
+  unnest_tokens(word, text, token="ngrams",n=2)
+
+#Calculating tfidf for bigrams, identified as most suitable earlier
+tokenized_tfidf <- revs_bigrams %>% 
+count(Review_ID, word,sort = TRUE) %>%
+    bind_tf_idf(word, Review_ID, n)
+
+#DTM for bigrams in reviews by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Review_ID, word, tf_idf) 
+dtm_tfidf
+#Reducing dimensionality, removing terms that are too common and too rare
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.99)
+
+#Converting dtm for bigrams to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Review_ID = document) -> dtm_2_df
+
+#Plotting top important bigrams in all reviews
+p13 <- dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(20) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Bigrams in All Reviews")
+print(p13)
+
+#Wordcloud for important bigrams in all Reviews
+dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Bigrams in Reviews")  
+
+#Average Review Rating vs Average Critic Score for Imp Bigrams
+mov_reviews_cleaned %>% dplyr::select(Review_ID, Rating, Metascore) -> to_join
+dtm_2_df <- dtm_2_df %>% left_join(to_join, by = "Review_ID")
+dtm_2_df <- na.omit(dtm_2_df)
+
+p14 <- dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_rating = mean(Rating), 
+            avg_score = mean(Metascore)) %>% 
+  top_n(15, total_tf_idf)  %>%
+  ggplot(aes(avg_rating, avg_score)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term)) +
+  labs(title="Ratings vs Critic Score for Top Bigrams in Reviews",
+         y = "Average Critic Score",
+         x = "Average Review Rating") 
+
+print(p14)
+
+```
+
+### Trigrams Aggregation by Review
+
+```{r Trigrams Aggregation by Review}
+#Extracting trigrams in all reviews
+revs_trigrams <- tokenized_revs %>%
+  unnest_tokens(word,text,token="ngrams",n=3) %>%
+  na.omit() 
+
+#Calculating tfidf for trigrams, identified as most suitable earlier
+tokenized_tfidf <- revs_trigrams %>% 
+count(Review_ID, word,sort = TRUE) %>%
+    bind_tf_idf(word, Review_ID, n)
+
+#DTM for trigrams in reviews by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Review_ID, word, tf_idf) 
+dtm_tfidf
+#Reducing dimensionality, removing terms that are too common and too rare
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.996)
+
+#Converting dtm for trigrams to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Review_ID = document) -> dtm_3_df
+
+#Plotting top important trigrams in all reviews
+p15 <- dtm_3_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(20) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Trigrams in All Reviews")
+print(p15)
+
+#Wordcloud for important trigrams in all Reviews
+dtm_3_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Tirgrams in Reviews")  
+
+#Average Review Rating vs Average Critic Score for Imp Trigrams
+mov_reviews_cleaned %>% dplyr::select(Review_ID, Rating, Metascore) -> to_join
+dtm_3_df <- dtm_3_df %>% left_join(to_join, by = "Review_ID")
+dtm_3_df <- na.omit(dtm_3_df)
+
+p16 <- dtm_3_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_rating = mean(Rating), 
+            avg_score = mean(Metascore)) %>% 
+  top_n(15, total_tf_idf)  %>%
+  ggplot(aes(avg_rating, avg_score)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term)) +
+  labs(title="Ratings vs Critic Score for Top Trigrams in Reviews",
+         y = "Average Critic Score",
+         x = "Average Review Rating") 
+
+print(p16)
+
+```
+
+## Important Words Across All Storylines
+### Unigrams Aggregation by Storyline
+
+```{r Unigrams Aggregation by Storyline}
+#Counting tokenized unigram counts by movie
+tokenized_counts <- meta_unigrams %>%
+  count(Movie_ID, word,sort = TRUE)
+
+#Getting total number of unigrams in each storyline
+total_words <- tokenized_counts %>%
+  group_by(Movie_ID) %>%
+  summarize(total = sum(n))
+tokenized_counts <- tokenized_counts %>% 
+  left_join(total_words, by ="Movie_ID")
+
+#Plotting the unigram word frequencies for all storylines
+p17 <- tokenized_counts %>%
+  mutate(tf = n/total) %>%
+  ggplot(aes(x=tf))+
+  geom_histogram(show.legend = FALSE)+xlim(0.00,0.20)+
+labs(x="tf", y = "Count", title ="Unigram Frequencies for All Storylines")
+print(p17)
+
+#From the above plot it is clear that many words occur rarely 
+#while fewer words occur frequently, hence the Ziph's law plot should show this trend 
+p18 <- tokenized_counts%>%
+       group_by(word) %>% 
+       summarise(total = sum(n)) %>% 
+       arrange(desc(total)) %>% 
+      mutate(rank = row_number(),
+      tf = total/sum(total)) %>% 
+  ggplot(aes(rank, tf)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = TRUE) +
+  scale_x_log10() +
+  scale_y_log10() + 
+  labs(x="Rank", y="tf", title = "Ziph's Law for Unigrams in Storylines")
+print(p18)
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#since it penalizes words that are very common, Calculating tfidf for unigrams
+tokenized_tfidf <- tokenized_counts %>%
+    bind_tf_idf(word, Movie_ID, n)
+
+#DTM for unigrams in storylines by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Movie_ID, word, tf_idf) 
+dtm_tfidf
+#Dimensionality is low, not removing sparse terms
+
+#Converting dtm for unigrams in storylines to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Movie_ID = document) -> dtm_1_df
+
+#Wordcloud for important unigrams in all storylines
+dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Unigrams in Storylines")  
+
+#Plotting top important unigrams in all storylines
+p19 <- dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(20) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Unigrams in All Storylines")
+print(p19)
+
+#Average Critic Score vs Gross Worldwide for Imp Words
+mov_meta_cleaned %>% dplyr::select(Movie_ID, Metascore, 
+                                      Gross_Worldwide) -> to_join
+dtm_1_df[["Movie_ID"]] <- as.numeric(dtm_1_df[["Movie_ID"]])
+dtm_1_df <- dtm_1_df %>% left_join(to_join, by = "Movie_ID")
+dtm_1_df <- na.omit(dtm_1_df)
+
+#Calculating avg gross for movies that contain the unigrams
+dtm_1_df$Gross_Worldwide <- dtm_1_df$Gross_Worldwide %>% 
+  parse_number(.) 
+dtm_1_df <- dtm_1_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_score = mean(Metascore), 
+            avg_gross = mean(Gross_Worldwide))
+
+p20 <- dtm_1_df %>% 
+  top_n(15, total_tf_idf)  %>%
+  ggplot(aes(avg_score, avg_gross)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term)) +
+  scale_y_continuous(labels = label_number_si(accuracy=0.1))+ 
+  labs(title="Critic Score vs Gross for Top Unigrams in Storylines",
+         y = "Average Gross",
+         x = "Average Critic Score") 
+
+print(p20)
+```
+
+### Bigrams Aggregation by Storyline
+
+```{r Bigrams Aggregation by Storyline}
+#Extracting bigrams in all storylines
+meta_bigrams <- tokenized_meta %>%
+  unnest_tokens(word,text,token="ngrams",n=2) %>%
+  na.omit() 
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#Calculating tfidf for bigrams in all storylines
+tokenized_tfidf <- meta_bigrams %>%
+  count(Movie_ID, word,sort = TRUE) %>% 
+  bind_tf_idf(word, Movie_ID, n)
+
+#DTM for bigrams in storylines by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Movie_ID, word, tf_idf) 
+dtm_tfidf
+
+#Converting dtm for bigrams in storylines to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Movie_ID = document) -> dtm_2_df
+
+#Wordcloud for important bigrams in all storylines
+dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Bigrams in Storylines")  
+
+#Reducing dimensionality
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.95)
+
+#Converting dtm for bigrams in storylines to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Movie_ID = document) -> dtm_2_df
+
+#Plotting top important bigrams in all storylines
+p21 <- dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(20) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Bigrams in All Storylines")
+print(p21)
+
+#Average Critic Score vs Gross Worldwide for Imp Words
+mov_meta_cleaned %>% dplyr::select(Movie_ID, Metascore, 
+                                      Gross_Worldwide) -> to_join
+dtm_2_df[["Movie_ID"]] <- as.numeric(dtm_2_df[["Movie_ID"]])
+dtm_2_df <- dtm_2_df %>% left_join(to_join, by = "Movie_ID")
+dtm_2_df <- na.omit(dtm_2_df)
+
+#Calculating avg gross for movies that contain the bigrams
+dtm_2_df$Gross_Worldwide <- dtm_2_df$Gross_Worldwide %>% 
+  parse_number(.) 
+dtm_2_df <- dtm_2_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_score = mean(Metascore), 
+            avg_gross = mean(Gross_Worldwide))
+
+p22 <- dtm_2_df %>% 
+  top_n(15, total_tf_idf)  %>%
+  ggplot(aes(avg_score, avg_gross)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term), max.overlaps = 20) +
+  scale_y_continuous(labels = label_number_si(accuracy=0.1))+ 
+  labs(title="Critic Score vs Gross for Top Bigrams in Storylines",
+         y = "Average Gross",
+         x = "Average Critic Score") 
+
+print(p22)
+
+```
+
+### Trigrams Aggregation by Storyline
+
+```{r Trigrams Aggregation by Storyline}
+#Extracting trigrams in all storylines
+meta_trigrams <- tokenized_meta %>%
+  unnest_tokens(word,text,token="ngrams",n=3) %>%
+  na.omit() 
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#Calculating tfidf for trigrams in all storylines
+tokenized_tfidf <- meta_trigrams %>%
+  count(Movie_ID, word,sort = TRUE) %>% 
+  bind_tf_idf(word, Movie_ID, n)
+
+#DTM for trigrams in storylines by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Movie_ID, word, tf_idf) 
+dtm_tfidf
+
+#Converting dtm for trigrams to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Movie_ID = document) -> dtm_3_df
+
+#Plotting top important trigrams in all storylines
+p23 <- dtm_3_df %>% 
+  filter(str_detect
+  (term,"iron|captain|strange|tony|avengers|spider|hulk|black|galaxy"))%>%
+  group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf))  %>%
+  top_n(20, total_tf_idf) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = "tf-idf", y = "Words", title = "Important Trigrams in All Storylines")
+print(p23)
+
+#Wordcloud for important trigrams in all storylines
+dtm_3_df %>% filter(str_detect
+  (term,"iron|captain|strange|tony|avengers|spider|hulk|black|galaxy")) %>% 
+  group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% arrange(desc(total_tf_idf)) -> wc_df
+wordcloud(wc_df$term, wc_df$total_tf_idf,     
+          scale = c(2.5, 0.5),     
+          0,                     
+          max.words = 200,       
+          colors = brewer.pal(8, "Dark2"))    
+title(sub = "Important Trigrams in Storylines")  
+
+
+#Average Critic Score vs Gross Worldwide for Imp Words
+mov_meta_cleaned %>% dplyr::select(Movie_ID, Metascore, 
+                                      Gross_Worldwide) -> to_join
+dtm_3_df[["Movie_ID"]] <- as.numeric(dtm_3_df[["Movie_ID"]])
+dtm_3_df <- dtm_3_df %>% left_join(to_join, by = "Movie_ID")
+dtm_3_df <- na.omit(dtm_3_df)
+
+#Calculating avg gross for movies that contain the trigrams
+dtm_3_df$Gross_Worldwide <- dtm_3_df$Gross_Worldwide %>% 
+  parse_number(.) 
+dtm_3_df <- dtm_3_df %>% group_by(term) %>% 
+  summarise(total_tf_idf = sum(tf_idf), 
+            avg_score = mean(Metascore), 
+            avg_gross = mean(Gross_Worldwide))
+
+p24 <- dtm_3_df %>% filter(str_detect
+  (term,"iron|captain|strange|tony|avengers|spider|hulk|black|galaxy"))%>%
+  top_n(10, total_tf_idf)  %>%
+  ggplot(aes(avg_score, avg_gross)) +
+  geom_point(aes(size = total_tf_idf)) +
+  geom_text_repel(aes(label=term)) +
+  scale_y_continuous(labels = label_number_si(accuracy=0.1))+ 
+  labs(title="Critic Score vs Gross for Top Trigrams in Storylines",
+         y = "Average Gross",
+         x = "Average Critic Score") 
+
+print(p24)
+
+```
+
+## Important Terms Across Review Ratings
+
+```{r Bigrams Aggregation by Rating}
+#Extracting bigrams by review rating
+tokenized_rat <- tibble(Review_ID = mov_reviews_cleaned$Review_ID, text = mov_reviews_cleaned$ReviewText, Rating = mov_reviews_cleaned$Rating)
+
+rat_bigrams <- tokenized_rat %>% unnest_tokens(word, text, token="ngrams", n=2)
+#Removing stopwords from bigrams
+bigrams_separated <- rat_bigrams %>%
+  separate(word, c("word1", "word2"), sep = " ")
+#Filtered bigrams
+rat_bigrams <- bigrams_separated %>%
+  filter(!word1 %in% all_stopwords_revs$word) %>%
+  filter(!word2 %in% all_stopwords_revs$word)
+rat_bigrams$word <- paste(rat_bigrams$word1, rat_bigrams$word2, sep=" ")
+rat_bigrams$word1 <- NULL 
+rat_bigrams$word2 <- NULL
+
+#Counting tokenized bigram counts by review rating
+tokenized_counts <- rat_bigrams %>%
+  count(Rating, word,sort = TRUE)
+
+#Getting total number of bigram in each rating category
+total_words <- tokenized_counts %>%
+  group_by(Rating) %>%
+  summarize(total = sum(n))
+tokenized_counts <- tokenized_counts %>% 
+  left_join(total_words, by ="Rating")
+tokenized_counts <- na.omit(tokenized_counts)
+
+#the Ziph's law plot should show that few words occur frequently where as many 
+#words occur rarely
+p25 <- tokenized_counts%>%
+       group_by(Rating, word) %>% 
+       summarise(total = sum(n)) %>% 
+       arrange(desc(total)) %>% 
+      mutate(rank = row_number(),
+      tf = total/sum(total)) %>% 
+  ggplot(aes(rank, tf, fill = Rating)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) +
+  scale_x_log10() +
+  scale_y_log10() + 
+  facet_wrap(~Rating,ncol=3,scales = "free_y") +
+  labs(x="Rank", y="tf", title = "Ziph's Law for Terms in All Ratings")
+print(p25)
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#since it penalizes words that are very common, Calculating tfidf for bigrams
+tokenized_tfidf <- tokenized_counts %>%
+    bind_tf_idf(word, Rating, n)
+
+#DTM for terms in all ratings by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Rating, word, tf_idf) 
+dtm_tfidf
+#Reducing dimensionality, removing terms that are too common and too rare
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.86)
+
+#Converting dtm for terms to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Rating = document) -> dtm_df
+
+#Plotting important words in all ratings
+p26 <- dtm_df %>% group_by(Rating, term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(6) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf, fill = Rating))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Rating,ncol=3,scales = "free_y") +
+  labs(x = "tf-idf", y = "Words", title = "Important Terms in All Ratings")
+print(p26)
+
+```
+
+## Important Terms Across Reviews By Director
+
+```{r Bigrams Aggregation by Director}
+#Extracting bigrams by review rating
+tokenized_dir <- tibble(Review_ID = mov_reviews_cleaned$Review_ID, text = mov_reviews_cleaned$ReviewText, Director = mov_reviews_cleaned$Director)
+
+dir_bigrams <- tokenized_dir %>% unnest_tokens(word, text, token="ngrams", n=2)
+#Removing stopwords from bigrams
+bigrams_separated <- dir_bigrams %>%
+  separate(word, c("word1", "word2"), sep = " ")
+#Filtered bigrams
+dir_bigrams <- bigrams_separated %>%
+  filter(!word1 %in% all_stopwords_revs$word) %>%
+  filter(!word2 %in% all_stopwords_revs$word)
+dir_bigrams$word <- paste(dir_bigrams$word1, dir_bigrams$word2, sep=" ")
+dir_bigrams$word1 <- NULL 
+dir_bigrams$word2 <- NULL
+
+#Counting tokenized bigram counts in each review by director
+tokenized_counts <- dir_bigrams %>%
+  count(Director, word,sort = TRUE)
+
+#Getting total number of bigrams in reviews by director
+total_words <- tokenized_counts %>%
+  group_by(Director) %>%
+  summarize(total = sum(n))
+tokenized_counts <- tokenized_counts %>% 
+  left_join(total_words, by ="Director")
+tokenized_counts <- na.omit(tokenized_counts)
+
+#the Ziph's law plot should show that few words occur frequently where as many 
+#words occur rarely
+p27 <- tokenized_counts%>%
+       group_by(Director, word) %>% 
+       summarise(total = sum(n)) %>% 
+       arrange(desc(total)) %>% 
+      mutate(rank = row_number(),
+      tf = total/sum(total)) %>% 
+  ggplot(aes(rank, tf, fill = Director)) +
+  geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) +
+  scale_x_log10() +
+  scale_y_log10() + 
+  facet_wrap(~Director,ncol=3,scales = "free_y") +
+  labs(x="Rank", y="tf", title = "Ziph's Law for Terms in Reviews by Director")
+print(p27)
+
+#Since Ziph's Law is verified, the most suitable metric is tfidf 
+#since it penalizes words that are very common, Calculating tfidf for bigrams
+tokenized_tfidf <- tokenized_counts %>%
+    bind_tf_idf(word, Director, n)
+
+#DTM for terms in all reviews by director by tfidf
+dtm_tfidf <- tokenized_tfidf %>% cast_dtm(Director, word, tf_idf) 
+dtm_tfidf
+#Reducing dimensionality, removing terms that are too common and too rare
+dtm_tfidf <- removeSparseTerms(dtm_tfidf,0.92)
+
+#Converting dtm for terms to df
+tidy(dtm_tfidf)  %>% 
+  rename(tf_idf = count, Director = document) -> dtm_df
+
+#Plotting important words in all reviews by director
+p28 <- dtm_df %>% group_by(Director, term) %>% 
+  summarise(total_tf_idf = sum(tf_idf)) %>% 
+  arrange(desc(total_tf_idf)) %>%
+  top_n(7) %>% 
+  ggplot(aes(total_tf_idf, reorder(term, total_tf_idf, fill = Director))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Director,ncol=3,scales = "free_y") +
+  labs(x = "tf-idf", y = "Words", title = "Important Terms in Reviews by Director")
+print(p28)
+
+```
+
+---
+
+# Part B 
+## Review Data Preprocessing
+
+```{r PartB_Reviews_Preprocessing,eval=FALSE}
+movies_review_data <- readRDS("Marvel_Reviews_Data.rds")
+partb_revs_clean <- movies_review_data
+
+#Checking structure of constructed movies review data
+str(partb_revs_clean)
+
+#Converting columns to the appropritate datatype 
+partb_revs_clean[["Rating"]] <- as.numeric(partb_revs_clean[["Rating"]])
+partb_revs_clean[["Review_Date"]] <- as.Date(partb_revs_clean[["Review_Date"]], 
+                                                "%d %B %Y")
+
+#Removing uneccessary text from each review 
+partb_revs_clean$ReviewText <- 
+gsub(" found this helpful\\. Was this review helpful\\? Sign in to vote\\. Permalink", 
+  "", partb_revs_clean$ReviewText)
+partb_revs_clean$ReviewText <- gsub("\\s\\d+ out of \\d+$", 
+                                    "",partb_revs_clean$ReviewText)
+
+#Detecting language to filter for English reviews only
+partb_revs_clean$cld2_lang <- cld2::detect_language(partb_revs_clean$ReviewText)
+partb_revs_clean$cld3_lang <- cld3::detect_language(partb_revs_clean$ReviewText)
+which(partb_revs_clean$cld2_lang != partb_revs_clean$cld3_lang)
+#Upon manually checking results for cld2 and cld3, cld2 is better at identifying 
+#language correctly. 
+partb_revs_clean$cld3_lang <- NULL
+
+table(partb_revs_clean$cld2_lang !='en')
+#88 records have been identified as not English
+sum(is.na(partb_revs_clean$cld2_lang))
+#95 records are given NA as a value for language idenitifed
+#Since number of records in both cases are very low compared to 
+#the size of the dataset, ignoring these records will not affect our analysis
+
+#Filtering for only English reviews
+partb_revs_clean %>% filter(cld2_lang == 'en') -> partb_revs_clean
+partb_revs_clean['cld2_lang'] <- NULL
+
+#Trimming trailing, leading and whitespaces in between in text
+partb_revs_clean$ReviewText <- str_squish(partb_revs_clean$ReviewText)
+
+#Removing URLs from data
+#Removing urls starting with http
+partb_revs_clean$ReviewText <- gsub("http\\S+\\s*", "", partb_revs_clean$ReviewText)
+#Removing urls starting with www
+partb_revs_clean$ReviewText <- gsub("www.\\S+\\.\\S+\\s*", "", 
+                                    partb_revs_clean$ReviewText)
+#Checking if any other URLs are to be removed
+ex_url(partb_revs_clean$ReviewText) [is.na(ex_url(partb_revs_clean$ReviewText))==F]
+#which(is.na(ex_url(partb_revs_clean$ReviewText))==F)
+#Upon reviewing the above extracted URLs, they're word elongations 
+#in the form of 'www.' and not URLs, hence tackling them later. 
+
+#Removing numbers from data as they add no significant meaning 
+#(reviewed with multiple iterations)
+partb_revs_clean$ReviewText <- gsub('[[:digit:]]+', '', partb_revs_clean$ReviewText)
+
+#Removing text between brackets
+partb_revs_clean$ReviewText <- bracketX(partb_revs_clean$ReviewText)
+
+#Replacing contractions 
+partb_revs_clean$ReviewText <- replace_contraction(partb_revs_clean$ReviewText)
+
+#Replacing symbols
+partb_revs_clean$ReviewText <- replace_symbol(partb_revs_clean$ReviewText)
+
+#Replacing word elongations 
+partb_revs_clean$ReviewText <- replace_word_elongation(partb_revs_clean$ReviewText, 
+                                                       impart.meaning = FALSE)
+
+#Replace emoticons
+partb_revs_clean$ReviewText <- replace_emoticon(partb_revs_clean$ReviewText)
+
+#Replacing abbreviations
+#Common abbreviations in reviews
+abv <- c("pls", "rofl", "btw", "asap", "b/c", "tbh", "rdj", "omg", "rn", "ppl", 
+         "bts", "lmao","dr", "smiley", "lol")
+repl <- c("please","rolling on the floor laughing","by the way", 
+          "as soon as possible", "because", "to be honest", 
+          "robert downey jr", "oh my gosh", "right now", 
+          "people", "behind the scenes", "laughing my ass off","doctor", 
+          "happy", "laughing out loud")
+partb_revs_clean$ReviewText<- replace_abbreviation(partb_revs_clean$ReviewText, 
+                                                      abv, repl)
+
+#Removing non ascii characters
+partb_revs_clean$ReviewText <- replace_non_ascii(partb_revs_clean$ReviewText)
+
+#Removing spaces
+partb_revs_clean$ReviewText <- str_squish(partb_revs_clean$ReviewText)
+
+#Most reviews have a length falling in the range of 100 - 5000 characters. 
+#Filtering for reviews that only fall within the above identified range
+partb_revs_clean %>% filter(nchar(ReviewText) >= 100 & 
+                        nchar(ReviewText) <= 5000) -> partb_revs_clean
+
+saveRDS(partb_revs_clean, "PartB_Reviews_Cleaned.rds")
+
+```
+
+## Metadata Preprocessing
+
+```{r PartB_Metadata_Preprocessing,eval = FALSE}
+movies_metadata <- readRDS("Marvel_Metadata.rds")
+partb_meta_clean <- movies_metadata
+
+#Checking structure of movies metadata
+str(partb_meta_clean)
+
+#Converting required columns to the appropritate datatype 
+partb_meta_clean[["Movie_Rating"]] <- as.numeric(partb_meta_clean[["Movie_Rating"]])
+
+#Converting the runtime column to a unit in hours
+for (i in 1:length(partb_meta_clean$Runtime)) {
+  
+  temp <- as.numeric(unlist(regmatches(partb_meta_clean$Runtime[i], 
+                      gregexpr("[[:digit:]]+", partb_meta_clean$Runtime[i]))))
+  partb_meta_clean$Runtime[i] <- paste(temp[1], temp[2], sep=".")
+   
+}
+partb_meta_clean[["Runtime"]] <- as.numeric(partb_meta_clean[["Runtime"]])
+partb_meta_clean$Budget <- parse_number(partb_meta_clean$Budget)
+partb_meta_clean$Gross_Worldwide <- parse_number(partb_meta_clean$Gross_Worldwide)
+
+saveRDS(partb_meta_clean, "PartB_Metadata_Cleaned.rds")
+
+```
+
+## Joining Required Metadata With Review Data and Tokenizing
+
+```{r PartB_Tokenization}
+partb_meta_clean <- readRDS("PartB_Metadata_Cleaned.rds")
+partb_revs_clean <- readRDS("PartB_Reviews_Cleaned.rds")
+
+partb_meta_clean %>% dplyr::select(Movie_ID, Movie_Rating, Budget, 
+        Gross_Worldwide, Runtime, Soundmix, Languages, Director ) -> to_join
+
+partb_revs_clean <- partb_revs_clean %>% left_join(to_join, by = "Movie_ID")
+#Each ReviewID acts as a line number, hence do not need to add line number
+sentiment_df <- tibble(Review_ID = partb_revs_clean$Review_ID, 
+                       text = partb_revs_clean$ReviewText)
+sent_df_tokenized <- unnest_tokens(sentiment_df,word,text)
+sent_df_tokenized <- sent_df_tokenized %>% 
+  anti_join(stop_words)
+
+```
+
+## Handling Misspelled Words 
+
+```{r Handling misspelled words,eval=FALSE}
+#Getting unique words in data
+words_in_data <- unique(sent_df_tokenized$word)
+#Checking spelling of words in reviewtext
+misspelled_words <- hunspell(words_in_data)
+#Idenitfying unique misspelled words in reviewtext
+misspelled_words <- unique(unlist(misspelled_words))
+#Suggestions for misspelled words
+suggested_words <- hunspell_suggest(misspelled_words)
+saveRDS(suggested_words, "suggested_words.RDS")
+#Selecting only the top suggested word correction
+suggested_words <- unlist(lapply(suggested_words, function(x) x[1]))
+
+#Saving the misspelled words and corrected word in a dataframe 
+word_corrections_df <- as.data.frame(cbind(misspelled_words, suggested_words))
+#Count frequency of words in reviewtext
+count_df <- count(sent_df_tokenized, word)
+count_df <- inner_join(count_df, word_corrections_df, 
+                       by = c(word = "misspelled_words"))
+
+#Checking suggested word corrections manually, and making those changes
+#and saving them in Correct_Words.xlsx
+write.csv(count_df, "word_corrections.csv", row.names = F)
+#Reading corrected words
+corrected_words <- read.xlsx("Correct_Words.xlsx")                    
+corrected_words$suggested_words <- replace_na(corrected_words$suggested_words, "")
+#Ensuring only the whole word is replaced by adding \b escape character
+corrected_words$word <- paste0("\\b", corrected_words$word, "\\b")
+
+#Replacing misspelled words
+sentiment_df$text <- stri_replace_all_regex(sentiment_df$text, corrected_words$word, corrected_words$suggested_words, vectorize_all = FALSE)
+
+sentiment_df$text <- str_squish(sentiment_df$text)
+
+saveRDS(sentiment_df, "sentiment_df.RDS")
+
+```
+
+## Target Outcomes Distribution
+### Review Rating Distribution 
+
+```{r ReviewRating Distribution}
+#Plotting the distribution of rating
+p29 <- ggplot(partb_revs_clean) + geom_histogram(aes(Rating), 
+      binwidth=1) + labs(x="Rating", y="Frequency", 
+                         title = "Frequency Distribution of Rating")
+print(p29)
+#Not sampling data since counts of each rating category are significant, 
+#even though higher ratings are the majority
+
+```
+
+### Profit Distribution
+``` {r Profit Distribution}
+#Calculating profit 
+partb_revs_clean$Profit <- (partb_revs_clean$Gross_Worldwide - 
+                              partb_revs_clean$Budget)
+
+#Plotting the distribution of profit
+p30 <- ggplot(partb_revs_clean) + geom_histogram(aes(Profit)) + 
+  scale_x_continuous(labels = label_number_si(accuracy=0.1)) +
+  labs(x="Profit", y="Frequency", title = "Frequency Distribution of Profit")
+
+print(p30)
+#Not sampling data since counts of each profit category are distinct and 
+#few in number
+
+```
+
+## Normalized Dictionary Coverage and Sentiment Score Calculation
+
+``` {r Normalized Sentiment Score Calculation}
+#Getting required dictionaries
+# bing
+bing_dictionary <- get_sentiments("bing") 
+# Afinn
+afinn_dictionary <- get_sentiments("afinn") 
+# Loughran Dictionary
+lm_dictionary <- get_sentiments("loughran") 
+# NRC dictionary (feelings)
+nrc_dictionary <- get_sentiments("nrc")
+
+#Counting words in each review
+count_words_df <- unnest_tokens(sentiment_df,word,text) %>% count(Review_ID) 
+sentiment_df <- sentiment_df %>% left_join(count_words_df, by = 'Review_ID')
+names(sentiment_df)[names(sentiment_df) == 'n'] <- 'count_of_words'
+
+#Normalized Bing Sentiment Score
+#Counting words in each review that are present in bing dictionary
+match_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(bing_dictionary) %>% group_by(Review_ID) %>% 
+  summarise(match_c = sum(!is.na(sentiment))) 
+sentiment_df <- sentiment_df %>% left_join(match_df, by = 'Review_ID')
+#Adding counts of positive and negative words in each review in temporary df
+temp_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(bing_dictionary) %>% 
+count(Review_ID,sentiment,count_of_words,match_c) %>% 
+pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(bing_sentiment = 
+        ((positive-negative)/(positive+negative)) * (match_c/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_c <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+#Merging bing_sentiment with data
+sentiment_df <- sentiment_df %>% left_join(temp_df, by = "Review_ID")
+sentiment_df$match_c <- NULL
+
+#Normalized Loughran Sentiment Score
+#Counting words in each review that are present in loughran dictionary
+match_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(lm_dictionary) %>% group_by(Review_ID) %>% 
+  summarise(match_c = sum(!is.na(sentiment))) 
+sentiment_df <- sentiment_df %>% left_join(match_df, by = 'Review_ID')
+#Adding counts of positive and negative words in each review in temporary df
+temp_df <- unnest_tokens(sentiment_df, word, text) %>% 
+  left_join(lm_dictionary) %>% 
+  count(Review_ID,sentiment,count_of_words,match_c) %>% 
+  pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(lm_sentiment = 
+        ((positive-negative)/(positive+negative)) * (match_c/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_c <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+temp_df$uncertainty <- NULL
+temp_df$constraining <- NULL
+temp_df$litigious <- NULL
+temp_df$superfluous <- NULL
+#Merging bing_sentiment with data
+sentiment_df <- sentiment_df %>% left_join(temp_df, by = "Review_ID")
+sentiment_df$match_c <- NULL
+
+#Normalized NRC Sentiment Score
+#Counting words in each row that are present in nrc dictionary
+match_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(nrc_dictionary) %>% group_by(Review_ID) %>% 
+  summarise(match_c = sum(!is.na(sentiment))) 
+sentiment_df <- sentiment_df %>% left_join(match_df, by = 'Review_ID')
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sentiment_df, word, text) %>% 
+  left_join(nrc_dictionary) %>% 
+  count(Review_ID,sentiment,count_of_words,match_c) %>% 
+  pivot_wider(names_from = sentiment,values_from = n)
+temp_df[is.na(temp_df)] <- 0
+#Calculating normalized sentiment based on dictionary coverage
+temp_df <- temp_df %>% mutate(nrc_sentiment = 
+        ((positive-negative)/(positive+negative)) * (match_c/count_of_words))
+temp_df[is.na(temp_df)] <- 0
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_count <- NULL
+temp_df$negative <- NULL
+temp_df$'NA' <- NULL
+temp_df$positive <- NULL
+temp_df$anger <- NULL
+temp_df$anticipation <- NULL
+temp_df$disgust <- NULL
+temp_df$fear <- NULL
+temp_df$joy <- NULL
+temp_df$sadness <- NULL
+temp_df$surprise <- NULL
+temp_df$trust <- NULL
+#Merging bing_sentiment with sampled data
+sentiment_df <- sentiment_df %>% left_join(temp_df, by = "Review_ID")
+sentiment_df$match_c <- NULL
+
+#Normalized AFINN Sentiment Score
+#Counting words in each row that are present in loughran dictionary
+match_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(afinn_dictionary) %>% group_by(Review_ID) %>% 
+  summarise(match_c = sum(!is.na(value)))
+sentiment_df <- sentiment_df %>% left_join(match_df, by = 'Review_ID')
+#Adding counts of positive and negative words in each row in temporary df
+temp_df <- unnest_tokens(sentiment_df, word, text) %>% 
+  left_join(afinn_dictionary)
+temp_df[is.na(temp_df)] <- 0
+temp_df <- temp_df %>% group_by(Review_ID, match_c, count_of_words) %>% 
+  summarise(afinn_sentiment = sum(value))
+#Calculating normalized sentiment based on dictionary coverage
+temp_df$afinn_sentiment <- temp_df$afinn_sentiment *
+  (temp_df$match_c/temp_df$count_of_words)
+#Removing unecessary columns
+temp_df$count_of_words <- NULL
+temp_df$match_c <- NULL
+#Merging bing_sentiment with sampled data
+sentiment_df <- sentiment_df %>% left_join(temp_df, by = "Review_ID")
+sentiment_df$match_c <- NULL
+
+```
+
+## Sentiment Association With Target Outcomes
+### Evaluation Through Visualization 
+
+``` {r Dictionary Sentiment Visualization}
+#Comparing the differences in the dictionaries
+afinn <- sentiment_df
+afinn$Review_ID <- NULL
+afinn$text <- NULL
+afinn$count_of_words <- NULL
+afinn$bing_sentiment <- NULL
+afinn$nrc_sentiment <- NULL
+afinn$lm_sentiment <- NULL
+afinn$afinn_sentiment <- NULL
+afinn$sentiment <- sentiment_df$afinn_sentiment
+afinn$method <- "AFINN"
+afinn$row_num <- 1:nrow(afinn)
+
+bing <- sentiment_df
+bing$Review_ID <- NULL
+bing$text <- NULL
+bing$count_of_words <- NULL
+bing$afinn_sentiment <- NULL
+bing$nrc_sentiment <- NULL
+bing$lm_sentiment <- NULL
+bing$bing_sentiment <- NULL
+bing$sentiment <- sentiment_df$bing_sentiment
+bing$method <- "Bing"
+bing$row_num <- 1:nrow(bing)
+
+lm <- sentiment_df
+lm$Review_ID <- NULL
+lm$text <- NULL
+lm$count_of_words <- NULL
+lm$afinn_sentiment <- NULL
+lm$nrc_sentiment <- NULL
+lm$bing_sentiment <- NULL
+lm$lm_sentiment <- NULL
+lm$sentiment <- sentiment_df$lm_sentiment
+lm$method <- "Loughran"
+lm$row_num <- 1:nrow(lm)
+
+nrc <- sentiment_df
+nrc$Review_ID <- NULL
+nrc$text <- NULL
+nrc$count_of_words <- NULL
+nrc$afinn_sentiment <- NULL
+nrc$lm_sentiment <- NULL
+nrc$bing_sentiment <- NULL
+nrc$nrc_sentiment <- NULL
+nrc$sentiment <- sentiment_df$nrc_sentiment
+nrc$method <- "NRC"
+nrc$row_num <- 1:nrow(nrc)
+
+#Sentiment in each dictionary
+p31 <- bind_rows(afinn,bing, nrc, lm) %>% ggplot(aes(row_num, sentiment, 
+  fill = method)) + geom_col(show.legend = FALSE) + facet_wrap(~method, ncol = 1, 
+  scales = "free_y") + labs(x = "Index", y= "Sentiment", 
+                        title = "Comparison of Sentiment by Dictionary")
+print(p31)
+
+#Signwise dictionary comparison
+bing_sent <- sentiment_df %>%
+  mutate(index = row_number(), sign = sign(bing_sentiment)) %>%
+  ggplot(aes(x=index,y=bing_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+nrc_sent <- sentiment_df %>%
+  mutate(index = row_number(), sign = sign(nrc_sentiment)) %>%
+  ggplot(aes(x=index,y=nrc_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+afinn_sent <- sentiment_df %>%
+  mutate(index = row_number(), sign = sign(afinn_sentiment)) %>%
+  ggplot(aes(x=index,y=afinn_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+lm_sent <- sentiment_df %>%
+  mutate(index = row_number(), sign = sign(lm_sentiment)) %>%
+  ggplot(aes(x=index,y=lm_sentiment, fill = sign))+
+  geom_bar(stat="identity")
+p32 <- ggarrange(bing_sent,nrc_sent,afinn_sent,lm_sent,common.legend = TRUE, 
+                 legend = "bottom")
+annotate_figure(p32, top = 
+    text_grob("Signwise Comparison of Sentiment by Dictionary",  size = 14))
+
+print(p32)
+
+```
+
+### Evaluation Through Regression Models
+#### Target Outcome - Review Rating
+
+```{r Dictionary Evaluation Through Regression_P1}
+#Getting rating column 
+partb_revs_clean %>% dplyr::select(Review_ID,Rating) -> to_join
+sentiment_df <- sentiment_df%>% left_join(to_join, by="Review_ID") 
+
+#Linear regression model for each sentiment score
+bing_model_r <- lm(Rating~bing_sentiment, data = sentiment_df)
+summary(bing_model_r)
+afinn_model_r <- lm(Rating~afinn_sentiment, data=sentiment_df)
+summary(afinn_model_r)
+nrc_model_r <- lm(Rating~nrc_sentiment, data = sentiment_df)
+summary(nrc_model_r)
+lm_model_r <- lm(Rating~lm_sentiment, data = sentiment_df)
+summary(lm_model_r)
+
+stargazer(bing_model_r,afinn_model_r,lm_model_r,nrc_model_r, type = "text")
+#Bing sentiment appears to be the best dictionary since it has the largest 
+#significant regression coefficient and has the highest Rsquare value
+
+#Plotting Bing Sentiment Score's Relationship with Review Rating
+p33 <- sentiment_df %>% ggplot(aes(x=bing_sentiment,y= Rating))+ 
+  geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1)+ 
+  labs(x = "Bing Sentiment Score", y = "Rating", 
+       title = "Bing Sentiment vs Rating")+ylim(0,10)
+print(p33)
+#Clearly as rating increases, bing sentiment score increases
+
+#Comparing model fit with rating being unrelated to bing sentiment 
+baseline <- lm(Rating~1, data = sentiment_df)
+anova(baseline, bing_model_r)
+#Clearly model fit is significantly better when including bing sentiment
+
+#Verifying it with information gain for each sentiment score
+#ig_attributes_r <- information.gain(Rating ~., sentiment_df)
+#ig_attributes_r
+#Bing is the most appropriate
+
+```
+
+#### Target Outcome - Profit
+
+```{r Dictionary Evaluation Through Regression_P2}
+#Getting rating column 
+partb_revs_clean %>% dplyr::select(Review_ID,Profit) -> to_join
+sentiment_df <- sentiment_df%>% left_join(to_join, by="Review_ID") 
+
+#Linear regression model for each sentiment score
+bing_model_p <- lm(Profit~bing_sentiment, data = sentiment_df)
+summary(bing_model_p)
+afinn_model_p <- lm(Profit~afinn_sentiment, data=sentiment_df)
+summary(afinn_model_p)
+nrc_model_p <- lm(Profit~nrc_sentiment, data = sentiment_df)
+summary(nrc_model_p)
+lm_model_p <- lm(Profit~lm_sentiment, data = sentiment_df)
+summary(lm_model_p)
+
+stargazer(bing_model_p,afinn_model_p,lm_model_p,nrc_model_p, type = "text")
+#Loughran sentiment appears to be the best dictionary since it has the largest 
+#significant regression coefficient and has the highest Rsquare value 
+
+#Plotting Loughran Sentiment Score's Relationship with Profit
+p34 <- sentiment_df %>% ggplot(aes(x=lm_sentiment,y= Profit))+ 
+  geom_smooth(method="lm") + geom_point(size = 2, shape=1,alpha=0.1)+ 
+  scale_y_continuous(labels = label_number_si(accuracy=0.1)) +
+  labs(x = "Loughran Sentiment Score", y = "Profit", 
+       title = "Loughran Sentiment vs Profit")
+print(p34)
+#Clearly as profit increases, loughran sentiment score increases
+
+#Comparing model fit with profit being unrelated to loughran sentiment 
+baseline <- lm(Profit~1, data = sentiment_df)
+anova(baseline, lm_model_p)
+#Clearly model fit is significantly better when including loughran sentiment
+
+#Verifying it with information gain for each sentiment score
+#ig_attributes_p <- information.gain(Profit ~., sentiment_df)
+#ig_attributes_p
+#Eventhough ig for afinn sentiment is marginally higher than loughran sentiment
+#selecting loughran sentiment as the most approporiate for the predicting profit
+#since it has a higher regression coefficient (both models have same Rsquare)
+
+```
+
+## Affection Categorization Association With Target Outcomes 
+### Evaluation Through Visualization
+
+```{r Affection Categorization}
+#Counting words that match with nrc dictionary
+match_df <- unnest_tokens(sentiment_df, word, text) %>% 
+left_join(nrc_dictionary) %>% group_by(Review_ID) %>% 
+  summarise(nrc_match = sum(!is.na(sentiment))) 
+sentiment_df <- sentiment_df %>% left_join(match_df, by = 'Review_ID')
+
+#Extracting feelings and their score from the data 
+#Normalizing them with dictionary coverage
+feelings <- sentiment_df %>% 
+    unnest_tokens(word, text) %>% 
+    left_join(nrc_dictionary) %>% 
+    count(Review_ID,sentiment,count_of_words, nrc_match) %>% 
+    pivot_wider(names_from=sentiment, values_from=n) %>% 
+    dplyr::select(-c(negative, positive))
+  
+feelings[is.na(feelings)] <- 0
+#Calculating normalized score for each feeling
+feelings[4:11]<- feelings[4:11]*(feelings$nrc_match/feelings$count_of_words)
+feelings$count_of_words <- NULL
+feelings$nrc_match <- NULL
+feelings$'NA' <- NULL
+
+sentiment_df <- sentiment_df %>% left_join(feelings, by = "Review_ID")
+sentiment_df$nrc_match <- NULL
+  
+#Review Ratings by Feelings
+p35 <- sentiment_df %>% 
+  pivot_longer(anger:trust,names_to = "feeling",values_to="sentiment") %>% 
+  ggplot(aes(x=Rating,y=sentiment,fill=feeling))+
+  geom_smooth()+
+  facet_wrap(~feeling,scales="free_y",ncol=2)  + labs(x = "Review Rating", 
+                                    y = "Score",
+  title = "Review Ratings by Feelings Categorization")+
+  theme(legend.position="none")
+print(p35)
+
+#Profit by Feelings
+p36 <- sentiment_df %>% 
+  pivot_longer(anger:trust,names_to = "feeling",values_to="sentiment") %>% 
+  ggplot(aes(x=Profit,y=sentiment,fill=feeling))+
+  geom_smooth()+
+  scale_x_continuous(labels = label_number_si(accuracy=0.1)) +
+  facet_wrap(~feeling,scales="free_y",ncol=2)  + labs(x = "Profit", y = "Score",
+  title = "Profit by Feelings Categorization")+
+  theme(legend.position="none")
+print(p36)
+
+#By the plots, it's unsure if feelings affect review ratings and profit for a 
+#movie
+
+```
+
+### Evaluation Through Regression Models 
+#### Target Outcome - Review Rating
+
+```{r Feelings Regression_p1}
+#Since for review rating, bing sentiment was identified as the most suitable 
+#The bing model for rating is considered as baseline 
+summary(bing_model_r) #baseline 
+
+#Multiple Regression model for all feelings with bing sentiment
+feelings_model_r <- lm(Rating~bing_sentiment+anger+anticipation+disgust+
+                         fear+joy+sadness+surprise+trust, data = sentiment_df)
+summary(feelings_model_r)
+
+#Checking if model is better fitted after feelings are included with 
+#bing sentiment
+anova(bing_model_r, feelings_model_r)
+#Model is fitted better by including feelings in the regression model along 
+#with bing sentiment 
+
+stargazer(bing_model_r, feelings_model_r, type="text")
+
+```
+
+#### Target Outcome - Profit 
+
+```{r Feelings Regression_p2}
+#Since for profit, loughran sentiment was identified as the most suitable 
+#The loughran model for profit is considered as baseline 
+summary(lm_model_p) #baseline 
+
+#Multiple Regression model for all feelings with loughran sentiment
+feelings_model_p <- lm(Profit~lm_sentiment+anger+anticipation+disgust+
+                         fear+joy+sadness+surprise+trust, data = sentiment_df)
+summary(feelings_model_p)
+
+#Checking if model is better fitted after feelings are included with 
+#loughran sentiment
+anova(lm_model_p, feelings_model_p)
+#Model is fitted better by including feelings in the regression model along 
+#with loughran sentiment 
+
+stargazer(lm_model_p, feelings_model_p, type="text")
+
+``` 
+
+## Context Specific Keywords Association With Review Rating
+### Mention of Director Name in Review 
+
+```{r Director Name Mention}
+#Checking if director name is mentioned in review
+for(i in 1:nrow(partb_revs_clean)){
+   if (grepl(",", partb_revs_clean$Director[i])) {
+    partb_revs_clean$dir_mentioned[i] <- as.numeric(grepl
+                               (partb_revs_clean$Director[i],
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+    if (partb_revs_clean$dir_mentioned[i]==0) {
+    names <- unlist(strsplit(partb_revs_clean$Director[i], ", "))
+    for (j in 1:length(names)) { 
+      if (partb_revs_clean$dir_mentioned[i]==1) { 
+        break
+      }
+      partb_revs_clean$dir_mentioned[i] <- as.numeric(grepl
+                               (names[j],
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+    }
+    }
+    next
+   }
+   partb_revs_clean$dir_mentioned[i] <- as.numeric(grepl
+                               (partb_revs_clean$Director[i],
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+ }
+
+partb_revs_clean$dir_mentioned[partb_revs_clean$dir_mentioned == '0'] <- 'No'
+partb_revs_clean$dir_mentioned[partb_revs_clean$dir_mentioned == '1'] <- 'Yes'
+p37 <- partb_revs_clean %>%  ggplot(aes(x=factor(dir_mentioned),y=Rating)) + 
+    geom_boxplot() + 
+    labs(x="Diretor Mentioned", y="Rating", 
+         title = "Director Mentioned vs Not Mentioned in Reviews")
+print(37)
+
+t.test(partb_revs_clean$Rating~factor(partb_revs_clean$dir_mentioned))
+#Reviews that have directors mentioned in them have a higher average rating
+
+```
+
+### Mention of Dominant Unigram, Bigram, Trigram in Reviews
+
+``` {r Mention of Dominant Words}
+#Mention of "Action"
+for(i in 1:nrow(partb_revs_clean)){
+
+   partb_revs_clean$action_mentioned[i] <- as.numeric(grepl
+                               ("action",
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+ }
+
+partb_revs_clean$action_mentioned[partb_revs_clean$action_mentioned == '0'] <- 'No'
+partb_revs_clean$action_mentioned[partb_revs_clean$action_mentioned == '1'] <- 'Yes'
+p38 <- partb_revs_clean %>%  ggplot(aes(x=factor(action_mentioned),y=Rating)) + 
+    geom_boxplot() + 
+    labs(x="Action Mentioned", y="Rating", 
+         title = "Action Mentioned vs Not Mentioned in Reviews")
+
+print(p38)
+t.test(partb_revs_clean$Rating~factor(partb_revs_clean$action_mentioned))
+#Reviews with keyword action mentioned have higher average rating 
+
+#Mention of "special effects"
+for(i in 1:nrow(partb_revs_clean)){
+
+   partb_revs_clean$sfx_mentioned[i] <- as.numeric(grepl
+                               ("special effects",
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+ }
+
+partb_revs_clean$sfx_mentioned[partb_revs_clean$sfx_mentioned == '0'] <- 'No'
+partb_revs_clean$sfx_mentioned[partb_revs_clean$sfx_mentioned == '1'] <- 'Yes'
+p39 <- partb_revs_clean %>%  ggplot(aes(x=factor(sfx_mentioned),y=Rating)) + 
+    geom_boxplot() + 
+    labs(x="Special Effects Mentioned", y="Rating", 
+         title = "Speical Effects Mentioned vs Not Mentioned in Reviews")
+
+print(p39)
+t.test(partb_revs_clean$Rating~factor(partb_revs_clean$sfx_mentioned))
+#Reviews with keyword speical effects mentioned have lower average rating 
+
+#Mention of "Robert Downey Jr"
+for(i in 1:nrow(partb_revs_clean)){
+
+   partb_revs_clean$rdj_mentioned[i] <- as.numeric(grepl
+                               ("robert downey jr",
+                               partb_revs_clean$ReviewText[i],
+                               ignore.case = T))
+ }
+
+partb_revs_clean$rdj_mentioned[partb_revs_clean$rdj_mentioned == '0'] <- 'No'
+partb_revs_clean$rdj_mentioned[partb_revs_clean$rdj_mentioned == '1'] <- 'Yes'
+p40 <- partb_revs_clean %>%  ggplot(aes(x=factor(rdj_mentioned),y=Rating)) + 
+    geom_boxplot() + 
+    labs(x="Robert Downey Jr Mentioned", y="Rating", 
+         title = "Robert Downey Jr Mentioned vs Not Mentioned in Reviews")
+
+print(p40)
+t.test(partb_revs_clean$Rating~factor(partb_revs_clean$rdj_mentioned))
+#Reviews with keyword robert downey jr mentioned have higher average rating 
+
+```
+
+## Text Metrics Association With Review Rating
+### Readability
+
+``` {r Readability, eval = FALSE}
+#Calculating readability of reviews 
+rev_readability <- flesch_kincaid(sentiment_df$text,sentiment_df$Review_ID)
+rev_readability$Readability %>% dplyr::select(Review_ID,FK_grd.lvl) -> to_join
+sentiment_df %>% left_join(to_join, by = "Review_ID") -> sentiment_df
+
+```
+
+```{r plotting readability}
+sentiment_df <- readRDS("sentiment_df_textmetrics.rds")
+
+#Plotting readability by rating 
+p41 <- sentiment_df %>% na.omit() %>% 
+  group_by(Rating) %>% summarise(avg_readbility=mean(FK_grd.lvl)) %>% 
+  ggplot(aes(x=avg_readbility,y=Rating))+geom_point(alpha = 0.3)+
+  labs(x="Average Readability", y="Rating", 
+       title = "Average Readability by Rating")
+print(p41)
+
+```
+
+### Diversity 
+
+```{r Diversity, eval=FALSE}
+#Calculating diversity in reviews
+diversity <- qdap::diversity(sentiment_df$text,sentiment_df$Rating)
+saveRDS(diversity, "diversity.rds")
+
+```
+
+```{r plotting diversity}
+diversity <- readRDS("diversity.rds")
+#Plotting diversity
+plot(diversity)
+
+```
+
+### Polarity 
+
+```{r Polarity, eval = FALSE}
+#Calculating polarity in reviews
+polarity <- qdap::polarity(sentiment_df$text,sentiment_df$Review_ID)
+polarity$all %>% dplyr::select(Review_ID, polarity, wc) -> to_join
+sentiment_df %>% left_join(to_join, by = "Review_ID") -> sentiment_df
+
+```
+
+```{r plotting polarity}
+#Plotting polarity by rating
+p43 <- sentiment_df %>% na.omit() %>% 
+  group_by(Rating) %>% summarise(avg_pol=mean(polarity)) %>% 
+  ggplot(aes(x=avg_pol,y=Rating))+geom_point(alpha = 0.3)+
+  labs(x="Average Polarity", y="Rating", 
+       title = "Average Polarity by Rating")
+print(p43)
+
+```
+
+### Wordcount of Each Review
+
+```{r WordC}
+#Plotting word count by rating
+p44 <- sentiment_df %>% na.omit() %>% 
+  group_by(Rating) %>% summarise(avg_wc=mean(wc)) %>% 
+  ggplot(aes(x=avg_wc,y=Rating))+geom_point(alpha = 0.3)+
+  labs(x="Average Word Count", y="Rating", 
+       title = "Average Word Count by Rating")
+print(p44)
+
+```
+
+--- 
+
+# Part C 
+## Data Preparation
+
+```{r PartC_DataPreparation, eval = FALSE}
+movies_review_data <- readRDS("Marvel_Reviews_Data.rds")
+partc_revs_clean <- movies_review_data
+
+#Checking structure of data
+str(partc_revs_clean)
+
+#Converting columns to the appropritate datatype 
+partc_revs_clean[["Rating"]] <- as.numeric(partc_revs_clean[["Rating"]])
+partc_revs_clean[["Review_Date"]] <- as.Date(partc_revs_clean[["Review_Date"]], 
+                                                "%d %B %Y")
+#Setting character set to latin or ascii
+partc_revs_clean$ReviewText <- iconv(partc_revs_clean$ReviewText)
+
+#cld2 was identified as the better package for language prediction
+partc_revs_clean$cld_land <- detect_language(partc_revs_clean$ReviewText)
+
+#Filtering for only English reviews
+partc_revs_clean %>% filter(cld_land == 'en') -> partc_revs_clean
+partc_revs_clean['cld2_lang'] <- NULL
+
+```
+
+## Part of Speech Tagging
+
+```{r POS Tagging, eval = FALSE}
+#Downloading English Model
+langmodel_download <- udpipe_download_model("english")
+#Loading the langugage model 
+langmodel <- udpipe_load_model(langmodel_download$file_model)
+
+#Annotation
+postagged <- udpipe_annotate(langmodel,
+                             partc_revs_clean$ReviewText,
+                             parallel.cores = 8,
+                             trace = 1000)
+
+postagged <- as.data.frame(postagged)
+#saveRDS(postagged, "postagged.rds")
+
+#postagged <- readRDS("postagged.rds")
+#lemmatizing pos tagged data
+lematized_data <- postagged %>% filter(upos %in% c("NOUN",
+                                              "ADJ",
+                                              "ADV")) %>% 
+  select(doc_id,lemma) %>% group_by(doc_id) %>% 
+  summarise(documents_pos_tagged = paste(lemma,collapse = " "))
+
+partc_revs_clean <- partc_revs_clean %>% mutate(doc_id = 
+                                              paste0("doc",row_number()))
+
+partc_revs_clean <- partc_revs_clean %>% 
+  left_join(lematized_data)
+
+```
+
+## Joining Required Metadata 
+
+``` {r Joining Metadata, eval = FALSE}
+partc_metadata_clean <- readRDS("Marvel_Metadata.rds")
+partc_metadata_clean %>% dplyr::select(Movie_ID, Soundmix, Languages, Phase) ->
+  to_join 
+partc_revs_clean %>% left_join(to_join, by = "Movie_ID") -> partc_revs_clean
+
+saveRDS(partc_revs_clean, "PartC_Reviews_Cleaned.rds")
+
+```
+
+## Pre-Processing 
+
+```{r stm preprocessing, eval = FALSE}
+#Removing missing values
+partc_revs_clean<- na.omit(partc_revs_clean)
+
+processed <- textProcessor(partc_revs_clean$documents_pos_tagged,
+                           metadata = partc_revs_clean,
+                           customstopwords = c(all_stopwords_revs$word),
+                           stem = F)
+
+```
+
+## Searching for Optimal Number of Topics
+
+```{r Optimal Number Search, eval = FALSE}
+# keep those words who appear more than 1% in the document corpus
+threshold <- round(1/100 * length(processed$documents),0)
+
+out <- prepDocuments(processed$documents,
+                     processed$vocab,
+                     processed$meta,
+                     lower.thresh = threshold)
+
+numtopics <- searchK(out$documents,out$vocab,K=seq(from=5, to=15,by=1))
+
+#Plotting Diagnostic Values for Number of Topics
+plot(numtopics)
+#K=12 is selected as optimal number of topics
+
+saveRDS(processed, "processed.rds")
+saveRDS(numtopics, "numtopics.rds")
+saveRDS(out, "out.rds")
+
+```
+
+## Unsupervised Topic Modelling
+### Executing STM for Topic Modelling Using Review Year
+
+```{r Topic Modelling, eval = FALSE}
+#Getting year for each review
+out$meta$Review_Year <- format(as.Date(out$meta$Review_Date, 
+                                             format="%Y-%m-%d"),"%Y")
+
+out$meta[["Review_Year"]] <- as.character(out$meta[["Review_Year"]])
+
+#Running topic model
+partc_topics <- stm(documents = out$documents,
+                   vocab = out$vocab,
+                   K = 12,
+                   prevalence =~ Review_Year,
+                   max.em.its = 75, 
+                   data = out$meta,
+                   reportevery=10,
+                   sigma.prior = 0.7,
+                   init.type = "LDA")
+
+saveRDS(partc_topics, "topics_reviewdate.rds")
+
+```
+
+#### Topic Solution & Statistics
+
+```{r Topic Solution}
+partc_revs_clean <- readRDS("PartC_Reviews_Cleaned.rds")
+partc_topics <- readRDS("topics_reviewdate.rds")
+out <- readRDS("out.rds")
+#Checking the topics created
+summary(partc_topics)
+
+#Labelling topics 
+topic_labels_reviewdaate <- c("Eternals Movie Script Development",
+                  "Movie Theatre Experience", 
+                  "Positive Opinions on MCU Movies", 
+                  "Thor's Characterestics", 
+                  "Black Panther Plot Discussion",
+                  "Opinion on Avengers Infinity War", 
+                  "Opinions on Visual Effects & Humour", 
+                  "Opinions on Heroes & Villains", 
+                  "Opinions on Lead Actors in Movies",
+                  "Spiderman Movies/Plot Discussion", 
+                  "Positive Opinions on Action & Cast",
+                  "Hulk & Iron Man Characteristics")
+                  
+#Calculating topic proportions
+topic_proportions_reviewdate <- colMeans(partc_topics$theta)
+proportions1 <- data.frame("Topic" = topic_labels_reviewdaate, 
+                           "Topic_Proportions" = topic_proportions_reviewdate)
+#Plotting topic proportion
+p45 <- proportions1 %>% ggplot(aes(x=Topic_Proportions,
+  y=reorder(Topic, Topic_Proportions))) + geom_point() + 
+  labs(x = "Proportion", y="Topic", title = "Proportion of Each Topic")
+print(p45)
+
+#Calculating beta matrix to get per topic per word probabilities
+topics1 <- tidy(partc_topics, matrix = "beta")
+
+#Visualizing top terms in each topic
+topic_terms <- topics1 %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+#Renaming topic labels
+for (i in 1:length(unique(topic_terms$topic))) {
+    topic_terms$topic[topic_terms$topic==i] <- topic_labels_reviewdaate[i]
+}
+
+p46 <- topic_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()+
+  labs(x= "Beta Metric", y="Words", title = "Most Probable Words in Each Topic")
+
+print(p46)
+
+#Review Date Distribution
+hist(as.numeric(out$meta$Review_Year),xlab="Review Year", 
+     main="Review Year Distribution",breaks = 50)
+
+#Since majority of reviews are from 2017, lot of the topics are more about the 
+#recent MCU movies, primarily - Avengers Infinity War, Guardians of the Galaxy, 
+#Spiderman. While some topics talk about the movies in general, Iron Man is 
+#the only character that was introduced well before 2019, that emereged as a topic
+
+#Calculating correlation between topics
+gamma_topics1 <- tidy(partc_topics,matrix="gamma")
+gamma_topics1 <- gamma_topics1 %>% 
+  pivot_wider(names_from = topic, values_from = gamma)
+colnames(gamma_topics1) <- c("document",topic_labels_reviewdaate)
+rownames(gamma_topics1) <- gamma_topics1$document
+gamma_topics1$document <- NULL 
+corrplot::corrplot(cor(gamma_topics1))
+
+#Plotting how different the topics are
+pcah <- FactoMineR::PCA(gamma_topics1,graph = FALSE)
+factoextra::fviz_pca_var(pcah)
+#The axis of each topic is not distint
+
+```
+
+#### Estimating Effects of Review Year on Topic Solution
+
+```{r estimation_1, eval=FALSE}
+effects <- estimateEffect(~ Review_Year,
+                          stmobj = partc_topics,
+                          metadata = out$meta )
+
+saveRDS(effects, "effects.rds")
+
+```
+
+```{r estimation_2}
+effects <- readRDS("effects.rds")
+
+#Plotting the effects 
+plot(effects, covariate = "Review_Year",
+     topics = c(1:12),
+     model = partc_topics, method = "difference",
+     cov.value1 = "2008", cov.value2 = "2022",
+     xlab = "2008  … 2022",
+     xlim = c(-0.04, 0.04),
+     main = "Marginal Effects",
+     custom.labels = topic_labels_reviewdaate,
+     labeltype = "custom")
+
+```
+
+### Executing STM for Topic Modelling Using Phase Number
+
+```{r Topic Modelling_2, eval = FALSE}
+
+partc_topics_2 <- stm(documents = out$documents,
+                   vocab = out$vocab,
+                   K = 12,
+                   prevalence =~Phase,
+                   max.em.its = 75, 
+                   data = out$meta,
+                   reportevery=10,
+                   sigma.prior = 0.7,
+                   init.type = "LDA")
+
+saveRDS(partc_topics_2, "topics_phase.rds")
+
+```
+
+#### Topic Solution & Statistics
+
+``` {r Topic Solution_2}
+partc_topics_2 <- readRDS("topics_phase.rds")
+#Checking the topics created
+summary(partc_topics_2)
+
+#Labelling topics 
+topic_labels_phase <- c("Opinions on Action Sequences", 
+                  "AntMan Movie & Character Sentiment", 
+                  "Discussion on Infinity War Battle", 
+                  "Black Widow & Black Panther Characteristics", 
+                  "Positive Opinions on Actors & Cast Chemistry",
+                  "Discussion on Avengers Saving the Planet", 
+                  "Avengers Endgame Movie Feelings",
+                  "Spiderman Movie/Plot Discussion", 
+                  "Positive Opinions on Spiderman Movies",
+                  "Negative Opinions on MCU Movies", 
+                  "Movie Quality - Visuals, Direction & Cinematography",
+                  "Thor & Hulk in Thor Ragnorok")
+
+#Calculating topic proportions
+topic_proportions_phase <- colMeans(partc_topics_2$theta)
+proportions2 <- data.frame("Topic" = topic_labels_phase, 
+                           "Topic_Proportions" = topic_proportions_phase)
+#Plotting topic proportion
+p47 <- proportions2 %>% ggplot(aes(x=Topic_Proportions,
+  y=reorder(Topic, Topic_Proportions))) + geom_point() + 
+  labs(x = "Proportion", y="Topic", title = "Proportion of Each Topic")
+print(p47)
+
+#Calculating beta matrix to get per topic per word probabilities
+topics2 <- tidy(partc_topics_2, matrix = "beta")
+
+#Visualizing top terms in each topic
+topic_terms <- topics2 %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+#Renaming topic labels
+for (i in 1:length(unique(topic_terms$topic))) {
+    topic_terms$topic[topic_terms$topic==i] <- topic_labels_phase[i]
+}
+
+p48 <- topic_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()+
+  labs(x= "Beta Metric", y="Words", title = "Most Probable Words in Each Topic")
+print(p48)
+
+#Review Distribution by Phase
+p49 <- partc_revs_clean %>% group_by(Phase) %>% summarise(total = n()) %>% 
+ggplot(aes(x =Phase, y =total)) + geom_point() + labs(x="Phase", 
+                y="Review Count", title = "Count of Reviews in Each ")
+print(p49)
+#Most topics are being dominated by reviews in phase 3
+
+#Calculating correlation between topics
+gamma_topics2 <- tidy(partc_topics_2,matrix="gamma")
+gamma_topics2 <- gamma_topics2 %>% 
+  pivot_wider(names_from = topic, values_from = gamma)
+colnames(gamma_topics2) <- c("document",topic_labels_phase)
+rownames(gamma_topics2) <- gamma_topics2$document
+gamma_topics2$document <- NULL 
+corrplot::corrplot(cor(gamma_topics2))
+
+#Plotting how different the topics are
+pcah <- FactoMineR::PCA(gamma_topics2,graph = FALSE)
+factoextra::fviz_pca_var(pcah)
+#The axis of each topic is disctint
+
+
+```
+
+#### Estimating Effect of Phase on Topic Solution
+
+```{r Estimating Effects, eval = FALSE}
+#Estimating effect of review date on topics
+effects2 <- estimateEffect(~ Phase,
+                          stmobj = partc_topics_2,
+                          metadata = out$meta )
+
+saveRDS(effects2, "effects2.rds")
+
+```
+
+```{r Plotting effects}
+#Plotting the effect of phase on topic solution 
+effects2 <- readRDS("effects2.rds")
+
+plot(effects2, covariate = "Phase",
+     topics = c(1:12),
+     model = partc_topics_2, method = "difference",
+     cov.value1 = "Phase 1", cov.value2 = "Phase 4",
+     xlab = "Phase 1 … Phase 4",
+     xlim = c(-0.04, 0.04),
+     main = "Marginal Effects",
+     custom.labels = topic_labels_phase,
+     labeltype = "custom")
+
+```
+
+### Executing STM for Topic Modelling Using Rating
+
+```{r Topic Modelling_3, eval = FALSE}
+
+partc_topics_3 <- stm(documents = out$documents,
+                   vocab = out$vocab,
+                   K = 12,
+                   prevalence = ~Rating,
+                   max.em.its = 75, 
+                   data = out$meta,
+                   reportevery=10,
+                   sigma.prior = 0.7,
+                   init.type = "LDA")
+
+saveRDS(partc_topics_3, "topics_rating.rds")
+```
+
+#### Topic Solution & Statistics
+
+``` {r Topic Solution_3}
+partc_topics_3 <- readRDS("topics_rating.rds")
+
+#Checking the topics created
+summary(partc_topics_3)
+
+#Labelling topics 
+topic_labels_rating <- c("Opinions on Soundtrack & Humour", 
+                  "Discussion on Avengers Franchise & Universe", 
+                  "Discussion on Heroes vs Aliens", 
+                  "Spiderman Movie/Plot Discussion", 
+                  "Discussion on Iron Man Movies",
+                  "Positive Opinions on Action Sequences", 
+                  "Negative Opinions on Hulk", 
+                  "Positive Opinions on Actors & Cast Chemistry",
+                  "Discussion on AntMan Movie/Plot",
+                  "Avengers Infinity War Final Battle",
+                  "Opinions on MCU Movies", 
+                  "Black Panther & Black Widow Characteristics")
+
+#Calculating topic proportions
+topic_proportions_phase <- colMeans(partc_topics_3$theta)
+proportions3 <- data.frame("Topic" = topic_labels_rating, 
+                           "Topic_Proportions" = topic_proportions_phase)
+#Plotting topic proportion
+p50 <- proportions3 %>% ggplot(aes(x=Topic_Proportions,
+  y=reorder(Topic, Topic_Proportions))) + geom_point() + 
+  labs(x = "Proportion", y="Topic", title = "Proportion of Each Topic")
+print(p50)
+
+#Calculating beta matrix to get per topic per word probabilities
+topics3 <- tidy(partc_topics_3, matrix = "beta")
+
+#Visualizing top terms in each topic
+topic_terms <- topics3 %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+#Renaming topic labels
+for (i in 1:length(unique(topic_terms$topic))) {
+    topic_terms$topic[topic_terms$topic==i] <- topic_labels_rating[i]
+}
+
+p51 <- topic_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()+
+  labs(x= "Beta Metric", y="Words", title = "Most Probable Words in Each Topic")
+print(p51)
+
+#Rating Distribution
+hist(partc_revs_clean$Rating,xlab="Rating", 
+     main="Rating Distribution",breaks = 50)
+#Counts for each rating category are distinct
+
+#Calculating correlation between topics
+gamma_topics3 <- tidy(partc_topics_3,matrix="gamma")
+gamma_topics3 <- gamma_topics3 %>% 
+  pivot_wider(names_from = topic, values_from = gamma)
+colnames(gamma_topics3) <- c("document",topic_labels_rating)
+rownames(gamma_topics3) <- gamma_topics3$document
+gamma_topics3$document <- NULL 
+corrplot::corrplot(cor(gamma_topics3))
+
+#Plotting how different the topics are
+pcah <- FactoMineR::PCA(gamma_topics3,graph = FALSE)
+factoextra::fviz_pca_var(pcah)
+#The axis of each topic is disctint
+
+```
+
+#### Estimating Effect of Rating on Topic Solution
+
+```{r Estimating Effect_2, eval = FALSE}
+#Estimating effect of review date on topics
+effects3 <- estimateEffect(~ Rating,
+                          stmobj = partc_topics_3,
+                          metadata = out$meta )
+
+saveRDS(effects3, "effects3.rds")
+
+```
+
+```{r Plotting effects_2}
+#Plotting the effect of phase on topic solution 
+effects3 <- readRDS("effects3.rds")
+
+plot(effects3, covariate = "Rating",
+     topics = c(1:12),
+     model = partc_topics_3, method = "difference",
+     cov.value1 = "0", cov.value2 = "10",
+     xlab = "Low Rating … High Rating",
+     xlim = c(-0.04, 0.04),
+     main = "Marginal Effects",
+     custom.labels = topic_labels_rating,
+     labeltype = "custom")
+
+```
+
+## Supervised Topic Modelling 
+### Setting up the corpus
+
+```{r slda, eval = FALSE}
+#Genrating corpus for supervised LDA 
+revs_data_slda <- tibble(Review_ID = partc_revs_clean$Review_ID, 
+                    text = partc_revs_clean$ReviewText, 
+                    Rating = partc_revs_clean$Rating,
+                    Review_Date = partc_revs_clean$Review_Date)
+
+revs_data_slda$text <- gsub(" found this helpful\\. Was this review helpful\\? Sign in to vote\\. Permalink", "", revs_data_slda$text)
+revs_data_slda$text <- gsub("\\s\\d+ out of \\d+$", "",
+                                       revs_data_slda$text)
+
+
+revs_data_slda$Review_Date <- format(as.Date(revs_data_slda$Review_Date, 
+                                             format="%Y-%m-%d"),"%Y")
+
+revs_data_slda <- na.omit(revs_data_slda)
+#Converting date to string 
+revs_data_slda[["Review_Date"]] <- as.character(revs_data_slda[["Review_Date"]])
+
+#Tokenizing 
+revs_data_slda %>% unnest_tokens(word,text) %>% anti_join(all_stopwords_revs) ->
+  revs_slda_tokenized
+
+#Merging words to sentences
+revs_slda_tokenized %>% na.omit() %>% group_by(Review_Date) %>% 
+  summarise(document_words = paste(word, collapse = " "), 
+            mean = mean(Rating)) -> revs_slda_date
+
+#Getting corpus reading for topic modelling
+revs_slda_bydate <- revs_slda_date %>% pull(document_words) %>%
+lexicalize(lower = TRUE)
+
+
+```
+
+### Running the topic model by providing the average review rating in each year
+
+``` {r Running topic model, eval = FALSE}
+#Kappa coefficient was identified as 12 earlier
+num_topics <- 12
+
+# Initialize the params
+params <- sample(c(-1, 1), num_topics, replace=TRUE)
+
+#Setting up the supervised topic model based on the input parameters set up 
+#by the author by running demo(slda)
+
+slda_topics_reviewdate <- slda.em(
+                   documents=revs_slda_bydate$documents,
+                   K=num_topics,                   
+                   vocab=revs_slda_bydate$vocab,
+                   num.e.iterations=10,
+                   num.m.iterations=4,
+                   alpha=1.0, eta=0.1,
+                   annotations = revs_slda_date$mean,
+                   params,
+                   variance=0.25,
+                   lambda=1.0,
+                   logistic=FALSE,
+                   method="sLDA")
+#saveRDS(slda_topics_reviewdate, "slda_topics_reviewdate.rds")
+
+```
+
+### Visualizing topic solution 
+
+```{r visualizing_slda}
+slda_topics_reviewdate <- readRDS("slda_topics_reviewdate.rds")
+
+#Getting top 7 words in each topic
+topics_slda <- slda_topics_reviewdate$topics %>%
+  top.topic.words(7, by.score = TRUE) 
+#Dominant words in each topic
+topics_slda
+
+#Labelling topics 
+topic_labels_slda <- c("Captain America Movies",
+                       "Opinions on Captain America Actor & Character", 
+                       "Thanos' Battle in movie Infinity War", 
+                       "Hulk & IronMan Character Discussion", 
+                       "Opinions on Avengers Age of Ultron", 
+                       "Opinions on Spiderman Homecoming and Thor Ragnorok",
+                       "Opinions on Phase 4 Movies", 
+                       "Emotions Expressed in Reviews", 
+                       "Opinions on Guardians of the Galaxy", 
+                       "Iron Man Characetistics", 
+                       "Opinions on Endgame and Captain Marvel", 
+                       "Opinions on Spiderman Far From Home")
+
+tl <- paste0("topic_",rep(1:12))
+
+#Labelled topics
+(data.frame(Topics = tl,Topics_Labelled = topic_labels_slda))
+
+summary(slda_topics_reviewdate$model)
+
+#Visualizing topics
+coefs <- data.frame(coef(summary(slda_topics_reviewdate$model)))
+coefs <- cbind(coefs,
+               topics = factor(topic_labels_slda,
+                               topic_labels_slda[order(coefs$Estimate,
+                                                   coefs$Std..Error)]))
+coefs <- coefs[order(coefs$Estimate), ]
+coefs %>% ggplot(aes(topics, Estimate, colour = Estimate)) +
+ geom_point() +
+  geom_errorbar(width = 0.5,
+    aes(ymin = Estimate - 1.96 * Std..Error,
+        ymax = Estimate + 1.96 * Std..Error)) +
+    coord_flip() + theme_bw() +
+  ggtitle("Topics")
+
+```
+
+---
